@@ -1,0 +1,27 @@
+HAND_CONNECTIONS = (
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+)
+
+P0_MOVING_AVG_WINDOW = 10
+GESTURE_MEDIAN_WINDOW = 10
+XY_DEAD_ZONE = 0.03
+Z_DEAD_ZONE = 0.02
+XY_MAX_DELTA = 0.30
+Z_MAX_DELTA = 0.12
+TURN_DEAD_ZONE_DEG = 10
+DEPTH_MEDIAN_WINDOW_RADIUS = 10
+
+VECTOR_EMA_ALPHA = 0.55
+ANGLE_EMA_BETA = 0.6
+YAW_SUSPECT_DELTA_PER_FRAME_DEG = 20.0
+MAX_YAW_DELTA_PER_FRAME_DEG = 30.0
+INVALID_HOLD_FRAMES = 2
+
+PALM_GESTURE_NAMES = {"palm", "open_palm"}
+ROCK_GESTURE_NAMES = {"rock", "closed_fist"}
+NONE_GESTURE_NAMES = {"none", "unknown"}
