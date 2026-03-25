@@ -15,10 +15,10 @@ def wrap_angle_rad(angle_rad):
 class GestureDroneController(Node):
     def __init__(
         self,
-        mavros_prefix="/drone2/mavros",
-        pose_topic="/drone2/mavros/vision_pose/pose",
+        mavros_prefix="/mavros",
+        pose_topic="/mavros/local_position/pose",
         move_duration_sec=0.8,
-        move_speed_xy=0.35,
+        move_speed_xy=0.8,
         move_speed_z=0.25,
         yaw_kp=0.8,
         max_yaw_rate=0.8,
@@ -26,9 +26,11 @@ class GestureDroneController(Node):
         yaw_sign=1.0,
     ):
         super().__init__("gesture_drone_controller")
+        self.pose_topic = pose_topic
+        self.cmd_vel_topic = f"{mavros_prefix}/setpoint_velocity/cmd_vel"
 
         self.velocity_pub = self.create_publisher(
-            TwistStamped, f"{mavros_prefix}/setpoint_velocity/cmd_vel", 10
+            TwistStamped, self.cmd_vel_topic, 10
         )
         self.pose_sub = self.create_subscription(
             PoseStamped, pose_topic, self.drone_pose_callback, 10
@@ -59,7 +61,10 @@ class GestureDroneController(Node):
         self._sent_stop = False
 
         self.control_timer = self.create_timer(0.05, self._control_loop)
-        self.get_logger().info("Gesture drone controller started")
+        self.get_logger().info(
+            "Gesture drone controller started "
+            f"(cmd_vel={self.cmd_vel_topic}, pose={self.pose_topic})"
+        )
 
     def drone_pose_callback(self, msg):
         self.drone_pose = msg
@@ -110,14 +115,36 @@ class GestureDroneController(Node):
             self.get_logger().warn("Ignoring palm_release without yaw_deg")
             return
 
+        yaw_delta_rad = math.radians(self.yaw_sign * event.yaw_deg)
+        duration_hint = max(
+            1.0,
+            abs(yaw_delta_rad) / max(self.max_yaw_rate, 1e-3) * 2.0,
+        )
+
         if self.current_yaw is None:
-            self.get_logger().warn("Ignoring palm_release: current yaw is unavailable")
+            # Fallback: open-loop yaw-rate command when pose yaw is unavailable.
+            yaw_rate = max(
+                -self.max_yaw_rate,
+                min(self.max_yaw_rate, self.yaw_kp * yaw_delta_rad),
+            )
+            if abs(yaw_rate) < 0.05:
+                yaw_rate = math.copysign(min(0.2, self.max_yaw_rate), yaw_delta_rad)
+
+            with self._lock:
+                self._rotation_target_yaw = None
+                self._rotation_deadline = 0.0
+                self._linear_cmd = (0.0, 0.0, 0.0)
+                self._yaw_rate_cmd = yaw_rate
+                self._command_until = time.monotonic() + duration_hint
+                self._sent_stop = False
+
+            self.get_logger().warn(
+                "Pose yaw unavailable, using open-loop rotation "
+                f"rate={yaw_rate:+.2f} rad/s duration={duration_hint:.2f}s"
+            )
             return
 
-        target_yaw = wrap_angle_rad(
-            self.current_yaw + math.radians(self.yaw_sign * event.yaw_deg)
-        )
-        duration_hint = max(1.0, abs(math.radians(event.yaw_deg)) / max(self.max_yaw_rate, 1e-3) * 2.0)
+        target_yaw = wrap_angle_rad(self.current_yaw + yaw_delta_rad)
 
         with self._lock:
             self._linear_cmd = (0.0, 0.0, 0.0)

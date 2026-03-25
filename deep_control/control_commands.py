@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 
 from control_config import PALM_GESTURE_NAMES, ROCK_GESTURE_NAMES
@@ -11,6 +12,7 @@ class CommandTrackerState:
     last_gesture_by_slot: dict
     last_fist_payload_by_slot: dict
     last_palm_payload_by_slot: dict
+    palm_heading_ref_by_slot: dict
 
 
 @dataclass
@@ -31,6 +33,7 @@ def create_command_tracker_state(hand_slots=HAND_SLOTS):
         last_gesture_by_slot={hand_slot: "unknown" for hand_slot in hand_slots},
         last_fist_payload_by_slot={hand_slot: None for hand_slot in hand_slots},
         last_palm_payload_by_slot={hand_slot: None for hand_slot in hand_slots},
+        palm_heading_ref_by_slot={hand_slot: None for hand_slot in hand_slots},
     )
 
 
@@ -39,6 +42,7 @@ def reset_command_tracker_state(command_state):
         command_state.last_gesture_by_slot[hand_slot] = "unknown"
         command_state.last_fist_payload_by_slot[hand_slot] = None
         command_state.last_palm_payload_by_slot[hand_slot] = None
+        command_state.palm_heading_ref_by_slot[hand_slot] = None
 
 
 def _snapshot_fist_payload(hand_state):
@@ -49,10 +53,23 @@ def _snapshot_fist_payload(hand_state):
     }
 
 
-def _snapshot_palm_payload(hand_state):
-    return {
-        "yaw_deg": hand_state.yaw_deg,
-    }
+def _wrap_angle_deg(angle_deg):
+    return math.degrees(math.atan2(math.sin(math.radians(angle_deg)), math.cos(math.radians(angle_deg))))
+
+
+def _compute_palm_heading_deg(hand_landmarks):
+    if hand_landmarks is None or len(hand_landmarks) <= 17:
+        return None
+
+    index_mcp = hand_landmarks[5]
+    pinky_mcp = hand_landmarks[17]
+    vx = float(pinky_mcp.x - index_mcp.x)
+    vz = float(pinky_mcp.z - index_mcp.z)
+    norm = math.hypot(vx, vz)
+    if norm < 1e-6:
+        return None
+
+    return math.degrees(math.atan2(vx, vz))
 
 
 def _append_fist_release_event(events, command_state, hand_slot, timestamp_ms, gesture_from, gesture_to):
@@ -104,8 +121,20 @@ def collect_command_events(frame_state, command_state, timestamp_ms):
 
         if current_gesture in ROCK_GESTURE_NAMES:
             command_state.last_fist_payload_by_slot[hand_slot] = _snapshot_fist_payload(hand_state)
-        if current_gesture in PALM_GESTURE_NAMES and hand_state.yaw_deg is not None:
-            command_state.last_palm_payload_by_slot[hand_slot] = _snapshot_palm_payload(hand_state)
+        if current_gesture in PALM_GESTURE_NAMES:
+            palm_heading_deg = _compute_palm_heading_deg(hand_state.hand_landmarks)
+            palm_heading_ref_deg = command_state.palm_heading_ref_by_slot.get(hand_slot)
+            if palm_heading_ref_deg is None and palm_heading_deg is not None:
+                command_state.palm_heading_ref_by_slot[hand_slot] = palm_heading_deg
+                palm_heading_ref_deg = palm_heading_deg
+
+            fallback_yaw_deg = None
+            if palm_heading_deg is not None and palm_heading_ref_deg is not None:
+                fallback_yaw_deg = _wrap_angle_deg(palm_heading_deg - palm_heading_ref_deg)
+
+            yaw_for_event = hand_state.yaw_deg if hand_state.yaw_deg is not None else fallback_yaw_deg
+            if yaw_for_event is not None:
+                command_state.last_palm_payload_by_slot[hand_slot] = {"yaw_deg": yaw_for_event}
 
         if previous_gesture != current_gesture:
             print("cur",current_gesture, "prev",previous_gesture)
@@ -114,9 +143,15 @@ def collect_command_events(frame_state, command_state, timestamp_ms):
                     events, command_state, hand_slot, timestamp_ms, previous_gesture, current_gesture
                 )
             if previous_gesture in PALM_GESTURE_NAMES:
+                if command_state.last_palm_payload_by_slot.get(hand_slot) is None:
+                    print(
+                        f"[COMMAND] palm_release skipped hand={hand_slot} "
+                        "reason=no_yaw_payload"
+                    )
                 _append_palm_release_event(
                     events, command_state, hand_slot, timestamp_ms, previous_gesture, current_gesture
                 )
+                command_state.palm_heading_ref_by_slot[hand_slot] = None
 
         command_state.last_gesture_by_slot[hand_slot] = current_gesture
 
@@ -128,12 +163,19 @@ def collect_command_events(frame_state, command_state, timestamp_ms):
                 events, command_state, hand_slot, timestamp_ms, previous_gesture, "unknown"
             )
         if previous_gesture in PALM_GESTURE_NAMES:
+            if command_state.last_palm_payload_by_slot.get(hand_slot) is None:
+                print(
+                    f"[COMMAND] palm_release skipped hand={hand_slot} "
+                    "reason=no_yaw_payload(slot_missing)"
+                )
             _append_palm_release_event(
                 events, command_state, hand_slot, timestamp_ms, previous_gesture, "unknown"
             )
+            command_state.palm_heading_ref_by_slot[hand_slot] = None
         command_state.last_gesture_by_slot[hand_slot] = "unknown"
         command_state.last_fist_payload_by_slot[hand_slot] = None
         command_state.last_palm_payload_by_slot[hand_slot] = None
+        command_state.palm_heading_ref_by_slot[hand_slot] = None
 
     return events
 
