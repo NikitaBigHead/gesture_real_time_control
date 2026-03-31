@@ -30,6 +30,7 @@ HAND_PRIORITY = ("right", "left")
 @dataclass
 class TrackingState:
     gesture_histories: dict
+    hand_slot_histories: dict
     p0_histories: dict
     control_start_points: dict
     yaw_states: dict
@@ -85,6 +86,7 @@ def create_gesture_history():
 def create_tracking_state(hand_slots=HAND_PRIORITY):
     return TrackingState(
         gesture_histories={hand_slot: create_gesture_history() for hand_slot in hand_slots},
+        hand_slot_histories={},
         p0_histories={hand_slot: create_p0_history() for hand_slot in hand_slots},
         control_start_points={hand_slot: None for hand_slot in hand_slots},
         yaw_states={hand_slot: create_yaw_state() for hand_slot in hand_slots},
@@ -132,6 +134,32 @@ def get_history_average_xyz(history):
     )
 
 
+def create_hand_slot_history():
+    return deque(maxlen=GESTURE_MEDIAN_WINDOW)
+
+
+def get_smoothed_hand_slot(history, default_slot):
+    slot_names = {slot_name for slot_name in history if slot_name is not None}
+    if not slot_names:
+        return default_slot
+
+    best_slot = None
+    best_key = None
+    for slot_name in slot_names:
+        presence = [1 if item == slot_name else 0 for item in history]
+        last_seen_index = max(i for i, item in enumerate(history) if item == slot_name)
+        sort_key = (
+            median(presence),
+            sum(presence),
+            last_seen_index,
+        )
+        if best_key is None or sort_key > best_key:
+            best_key = sort_key
+            best_slot = slot_name
+
+    return best_slot
+
+
 def reset_hand_tracking_state(hand_slot, tracking_state):
     if hand_slot not in tracking_state.p0_histories:
         tracking_state.p0_histories[hand_slot] = create_p0_history()
@@ -143,6 +171,7 @@ def reset_hand_tracking_state(hand_slot, tracking_state):
 def reset_tracking_state(tracking_state):
     for history in tracking_state.gesture_histories.values():
         history.clear()
+    tracking_state.hand_slot_histories.clear()
     for history in tracking_state.p0_histories.values():
         history.clear()
     for hand_slot in tracking_state.control_start_points:
@@ -166,7 +195,7 @@ def get_recognition_handedness_slot(recognition_result, hand_index):
     return None
 
 
-def get_hand_metadata(recognition_result, pose_result, hand_index):
+def get_hand_metadata(recognition_result, pose_result, hand_index, tracking_state=None, update_history=True):
     gesture_name = "Unknown"
     gesture_score = 0.0
     gesture_lines = ["Unknown"]
@@ -182,8 +211,17 @@ def get_hand_metadata(recognition_result, pose_result, hand_index):
     hand_landmarks = recognition_result.hand_landmarks[hand_index]
     hand_slot, pose_arm, pose_distance_sq = get_pose_arm_match(pose_result, hand_landmarks[0])
     recognition_handedness_slot = get_recognition_handedness_slot(recognition_result, hand_index)
-    if hand_slot is None and len(recognition_result.hand_landmarks) == 1:
+    if hand_slot is None:
         hand_slot = recognition_handedness_slot
+
+    if tracking_state is not None:
+        history = tracking_state.hand_slot_histories.setdefault(
+            hand_index,
+            create_hand_slot_history(),
+        )
+        if update_history:
+            history.append(hand_slot)
+        hand_slot = get_smoothed_hand_slot(history, hand_slot)
 
     handedness_label = hand_slot.capitalize() if hand_slot else ""
     if not handedness_label and recognition_handedness_slot is not None:
@@ -200,12 +238,12 @@ def get_hand_metadata(recognition_result, pose_result, hand_index):
     }
 
 
-def select_active_hand(recognition_result, pose_result):
+def select_active_hand(recognition_result, pose_result, tracking_state):
     best_indices_by_slot = {}
     best_distances_by_slot = {}
 
     for hand_index in range(len(recognition_result.hand_landmarks)):
-        metadata = get_hand_metadata(recognition_result, pose_result, hand_index)
+        metadata = get_hand_metadata(recognition_result, pose_result, hand_index, tracking_state)
         hand_slot = metadata["hand_slot"]
         if hand_slot is None:
             continue
@@ -298,14 +336,24 @@ def compute_frame_control_state(
     frame_height,
     tracking_state,
 ):
-    active_hand_slot, active_hand_index = select_active_hand(recognition_result, pose_result)
+    active_hand_slot, active_hand_index = select_active_hand(
+        recognition_result,
+        pose_result,
+        tracking_state,
+    )
     for hand_slot in HAND_PRIORITY:
         if hand_slot != active_hand_slot:
             reset_hand_tracking_state(hand_slot, tracking_state)
 
     hands = []
     for hand_index, hand_landmarks in enumerate(recognition_result.hand_landmarks):
-        metadata = get_hand_metadata(recognition_result, pose_result, hand_index)
+        metadata = get_hand_metadata(
+            recognition_result,
+            pose_result,
+            hand_index,
+            tracking_state,
+            update_history=False,
+        )
         gesture_name = metadata["gesture_name"]
         gesture_score = metadata["gesture_score"]
         gesture_lines = metadata["gesture_lines"]
