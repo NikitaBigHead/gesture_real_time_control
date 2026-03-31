@@ -24,6 +24,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from textwrap import wrap
 from typing import Optional
 
 import cv2
@@ -86,7 +87,8 @@ RS_WIDTH = 640
 RS_HEIGHT = 480
 DEPTH_SCALE_METERS = 0.001  # client sends uint16 depth in millimeters
 
-AUDIO_RATE = 16000
+MODEL_AUDIO_RATE = 16000
+DEFAULT_AUDIO_INPUT_RATE = 48000
 AUDIO_CHANNELS = 1
 AUDIO_CHUNK = 1024
 SILERO_WINDOW_SAMPLES = 512
@@ -145,10 +147,49 @@ class StreamStats:
                 log.info("[%s] packets=%d avg_delay=%.1f ms", self.name, self._count, avg_delay)
 
 
+class AudioRateConverter:
+    def __init__(self, input_rate: int, output_rate: int):
+        if input_rate <= 0 or output_rate <= 0:
+            raise ValueError("Audio sample rates must be positive.")
+
+        self._input_rate = input_rate
+        self._output_rate = output_rate
+        self._step = input_rate / output_rate
+        self._buffer = np.empty(0, dtype=np.float32)
+        self._position = 0.0
+
+    def convert(self, samples: np.ndarray) -> np.ndarray:
+        if self._input_rate == self._output_rate:
+            return samples
+
+        if samples.size == 0:
+            return np.empty(0, dtype=np.int16)
+
+        self._buffer = np.concatenate((self._buffer, samples.astype(np.float32)))
+        if self._buffer.size < 2:
+            return np.empty(0, dtype=np.int16)
+
+        max_position = self._buffer.size - 1
+        positions = np.arange(self._position, max_position, self._step, dtype=np.float64)
+        if positions.size == 0:
+            return np.empty(0, dtype=np.int16)
+
+        indices = positions.astype(np.int64)
+        fractions = positions - indices
+        converted = self._buffer[indices] * (1.0 - fractions) + self._buffer[indices + 1] * fractions
+
+        consumed = int(indices[-1])
+        self._buffer = self._buffer[consumed:]
+        self._position = positions[-1] + self._step - consumed
+
+        return np.clip(np.round(converted), -32768, 32767).astype(np.int16)
+
+
 class AudioSpeechPipeline:
     def __init__(
         self,
         enabled: bool,
+        input_sample_rate: int,
         whisper_model_name: str,
         language: Optional[str],
         vad_threshold: float,
@@ -157,12 +198,15 @@ class AudioSpeechPipeline:
         min_phrase_sec: float = 0.30,
     ):
         self.enabled = enabled
+        self._input_sample_rate = input_sample_rate
+        self._model_sample_rate = MODEL_AUDIO_RATE
+        self._rate_converter = AudioRateConverter(input_sample_rate, self._model_sample_rate)
         self._whisper_model_name = whisper_model_name
         self._language = language
         self._vad_threshold = vad_threshold
         self._end_delay_sec = end_delay_sec
-        self._pre_roll_chunks = max(1, int(pre_roll_sec * AUDIO_RATE / AUDIO_CHUNK))
-        self._min_phrase_samples = int(min_phrase_sec * AUDIO_RATE)
+        self._pre_roll_chunks = max(1, int(pre_roll_sec * input_sample_rate / AUDIO_CHUNK))
+        self._min_phrase_samples = int(min_phrase_sec * self._model_sample_rate)
 
         self._pre_roll: deque[np.ndarray] = deque(maxlen=self._pre_roll_chunks)
         self._phrase_chunks: list[np.ndarray] = []
@@ -176,6 +220,9 @@ class AudioSpeechPipeline:
         self._vad_model = None
         self._recognizer = sr.Recognizer() if sr is not None else None
         self._whisper_model = None
+        self._phrase_lock = threading.Lock()
+        self._latest_phrase = ""
+        self._latest_phrase_monotonic: Optional[float] = None
         self._use_speech_recognition_backend = (
             sr is not None
             and whisper is not None
@@ -214,7 +261,9 @@ class AudioSpeechPipeline:
         )
         self._worker.start()
         log.info(
-            "Audio transcription enabled: Silero VAD + Whisper %s (phrase_end_delay=%.1fs)",
+            "Audio transcription enabled: input_rate=%dHz -> model_rate=%dHz, Whisper %s (phrase_end_delay=%.1fs)",
+            input_sample_rate,
+            self._model_sample_rate,
             whisper_model_name,
             end_delay_sec,
         )
@@ -232,7 +281,7 @@ class AudioSpeechPipeline:
             offset += SILERO_WINDOW_SAMPLES
 
             audio_tensor = torch.from_numpy(window.astype(np.float32) / 32768.0)
-            speech_prob = float(self._vad_model(audio_tensor, AUDIO_RATE).item())
+            speech_prob = float(self._vad_model(audio_tensor, self._model_sample_rate).item())
             if speech_prob >= self._vad_threshold:
                 speech_detected = True
 
@@ -243,7 +292,10 @@ class AudioSpeechPipeline:
         if not self.enabled:
             return
 
-        chunk = np.asarray(samples, dtype=np.int16).copy()
+        chunk = self._rate_converter.convert(np.asarray(samples, dtype=np.int16).copy())
+        if chunk.size == 0:
+            return
+
         self._pre_roll.append(chunk)
         speech_detected = self._chunk_contains_speech(chunk)
         now = time.monotonic()
@@ -304,13 +356,17 @@ class AudioSpeechPipeline:
             try:
                 text = self._transcribe(utterance)
                 if text:
+                    print("detected speech",text)
+                    with self._phrase_lock:
+                        self._latest_phrase = text
+                        self._latest_phrase_monotonic = time.monotonic()
                     log.info("[Speech] %s", text)
             except Exception as exc:
                 log.error("Audio transcription failed: %s", exc)
 
     def _transcribe(self, utterance: np.ndarray) -> str:
         if self._use_speech_recognition_backend and self._recognizer is not None:
-            audio_data = sr.AudioData(utterance.tobytes(), AUDIO_RATE, 2)
+            audio_data = sr.AudioData(utterance.tobytes(), self._model_sample_rate, 2)
             kwargs = {
                 "model": self._whisper_model_name,
                 "fp16": self._fp16,
@@ -346,6 +402,17 @@ class AudioSpeechPipeline:
         if self._worker is not None:
             self._worker.join(timeout=5.0)
 
+    def get_latest_phrase(self, max_age_sec: float = 8.0) -> str:
+        if not self.enabled:
+            return ""
+
+        with self._phrase_lock:
+            if not self._latest_phrase or self._latest_phrase_monotonic is None:
+                return ""
+            if time.monotonic() - self._latest_phrase_monotonic > max_age_sec:
+                return ""
+            return self._latest_phrase
+
 
 class GestureServerRuntime:
     def __init__(self, args: argparse.Namespace):
@@ -368,6 +435,7 @@ class GestureServerRuntime:
         self._pose_landmarker = self._create_pose_landmarker(args.pose_model, args.use_gpu)
         self._audio = AudioSpeechPipeline(
             enabled=not args.disable_audio_recognition,
+            input_sample_rate=args.audio_input_rate,
             whisper_model_name=args.whisper_model,
             language=args.audio_language or None,
             vad_threshold=args.vad_threshold,
@@ -453,6 +521,54 @@ class GestureServerRuntime:
     def process_audio(self, samples: np.ndarray, send_ts: float) -> None:
         self._audio.process_chunk(samples, send_ts)
 
+    def _draw_detected_phrase(self, frame: np.ndarray) -> None:
+        phrase = self._audio.get_latest_phrase()
+        if not phrase:
+            return
+
+        lines = wrap(phrase, width=44)[:3]
+        line_height = 28
+        box_top = 12
+        box_left = 12
+        box_width = min(frame.shape[1] - 24, 620)
+        box_height = 18 + line_height * (len(lines) + 1)
+
+        cv2.rectangle(
+            frame,
+            (box_left, box_top),
+            (box_left + box_width, box_top + box_height),
+            (20, 20, 20),
+            -1,
+        )
+        cv2.rectangle(
+            frame,
+            (box_left, box_top),
+            (box_left + box_width, box_top + box_height),
+            (0, 180, 255),
+            2,
+        )
+        cv2.putText(
+            frame,
+            "Speech:",
+            (box_left + 12, box_top + 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 220, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        for index, line in enumerate(lines, start=1):
+            cv2.putText(
+                frame,
+                line,
+                (box_left + 12, box_top + 28 + index * line_height),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.72,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
     def process_rgb(self, frame: np.ndarray, send_ts: float) -> None:
         with self._depth_lock:
             depth = None if self._latest_depth is None else self._latest_depth.copy()
@@ -526,6 +642,7 @@ class GestureServerRuntime:
         if self.args.no_display:
             return
 
+        self._draw_detected_phrase(frame)
         cv2.imshow("Gesture Realtime Server", frame)
         if frame_depth_colormap is not None:
             cv2.imshow("Depth", frame_depth_colormap)
@@ -771,6 +888,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Sign multiplier for palm yaw delta",
+    )
+    parser.add_argument(
+        "--audio-input-rate",
+        type=int,
+        default=DEFAULT_AUDIO_INPUT_RATE,
+        help="Incoming PCM sample rate from the client. Audio is resampled to 16000 Hz for VAD/Whisper.",
     )
     parser.add_argument(
         "--disable-audio-recognition",
