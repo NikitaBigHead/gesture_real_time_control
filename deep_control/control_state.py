@@ -150,6 +150,22 @@ def reset_tracking_state(tracking_state):
         tracking_state.yaw_states[hand_slot] = create_yaw_state()
 
 
+def get_recognition_handedness_slot(recognition_result, hand_index):
+    if hand_index >= len(recognition_result.handedness):
+        return None
+    if not recognition_result.handedness[hand_index]:
+        return None
+
+    handedness_label = recognition_result.handedness[hand_index][0].category_name
+    if not handedness_label:
+        return None
+
+    normalized_label = handedness_label.strip().lower()
+    if normalized_label in ("left", "right"):
+        return normalized_label
+    return None
+
+
 def get_hand_metadata(recognition_result, pose_result, hand_index):
     gesture_name = "Unknown"
     gesture_score = 0.0
@@ -165,7 +181,13 @@ def get_hand_metadata(recognition_result, pose_result, hand_index):
 
     hand_landmarks = recognition_result.hand_landmarks[hand_index]
     hand_slot, pose_arm, pose_distance_sq = get_pose_arm_match(pose_result, hand_landmarks[0])
+    recognition_handedness_slot = get_recognition_handedness_slot(recognition_result, hand_index)
+    if hand_slot is None and len(recognition_result.hand_landmarks) == 1:
+        hand_slot = recognition_handedness_slot
+
     handedness_label = hand_slot.capitalize() if hand_slot else ""
+    if not handedness_label and recognition_handedness_slot is not None:
+        handedness_label = recognition_handedness_slot.capitalize()
 
     return {
         "gesture_name": gesture_name,
@@ -189,6 +211,8 @@ def select_active_hand(recognition_result, pose_result):
             continue
 
         pose_distance_sq = metadata["pose_distance_sq"]
+        if pose_distance_sq is None:
+            pose_distance_sq = float("inf")
         if (
             hand_slot not in best_indices_by_slot
             or pose_distance_sq < best_distances_by_slot[hand_slot]
