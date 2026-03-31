@@ -1,0 +1,12 @@
+# ──────────────────────────────────────────
+#  requirements_client.txt  (Orange Pi)
+# ──────────────────────────────────────────
+pyzmq>=25.0
+numpy>=1.24
+opencv-python>=4.8
+pyaudio>=0.2.13
+# pyrealsense2 is installed separately on ARM:
+#   https://github.com/IntelRealSense/librealsense/releases
+#   sudo apt install python3-pyrealsense2
+#   OR
+#   pip install pyrealsense2  (if a wheel exists for your platform)
