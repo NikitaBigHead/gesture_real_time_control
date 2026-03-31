@@ -76,8 +76,17 @@ def run_realtime_gesture_detection(model_path, pose_model_path, camera_id, show_
             "Provide a MediaPipe PoseLandmarker .task file via --pose-model."
         )
 
-    gesture_base_options = python.BaseOptions(model_asset_path=model_path)
-    pose_base_options = python.BaseOptions(model_asset_path=pose_model_path)
+    # gesture_base_options = python.BaseOptions(model_asset_path=model_path)
+    # pose_base_options = python.BaseOptions(model_asset_path=pose_model_path)
+    gesture_base_options = python.BaseOptions(
+    model_asset_path=model_path,
+    delegate=python.BaseOptions.Delegate.GPU,
+    )
+
+    pose_base_options = python.BaseOptions(
+        model_asset_path=pose_model_path,
+        delegate=python.BaseOptions.Delegate.GPU,
+    )
     gesture_options = vision.GestureRecognizerOptions(
         base_options=gesture_base_options,
         running_mode=vision.RunningMode.VIDEO,
@@ -245,7 +254,7 @@ def parse_args():
     parser.add_argument(
         "--drone-pose-topic",
         type=str,
-        default="/drone2/mavros/vision_pose/pose",
+        default="/drone2/mavros/local_position/pose",
         help="Pose topic used to estimate current drone yaw",
     )
     parser.add_argument(
