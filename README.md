@@ -40,3 +40,46 @@ Current control logic:
 - `rock` / `closed_fist` are used for linear motion relative to the hand start point.
 - `palm` / `open_palm` are used to estimate yaw from the palm direction relative to the forearm.
 - A command is not sent on every frame. It is sent as an event when the user releases the related gesture.
+
+## Yaw Troubleshooting
+
+If translation works but yaw does not, check the full chain:
+
+1. `palm_release` event must be generated.
+2. `yaw_deg` must be present in that event.
+3. Drone pose topic must provide orientation (for current yaw estimate).
+4. MAVROS must accept `TwistStamped.twist.angular.z` on `setpoint_velocity/cmd_vel`.
+
+Quick checks:
+
+```bash
+# Run detector and look for palm_release logs in terminal
+cd deep_control
+python gesture_realtime_hand_deep.py
+
+# In another terminal: verify pose topic publishes orientation
+ros2 topic echo /drone2/mavros/local_position/pose --once
+
+# Verify cmd_vel includes angular.z during a palm_release rotation
+ros2 topic echo /drone2/mavros/setpoint_velocity/cmd_vel
+```
+
+Notes:
+
+- Default pose topic is now `/drone2/mavros/local_position/pose`.
+- Rotation is event-based: yaw is queued when gesture transitions from `palm/open_palm` to another gesture.
+- If your setup uses different namespace, pass it explicitly:
+
+```bash
+python gesture_realtime_hand_deep.py \
+  --mavros-prefix /<your_ns>/mavros \
+  --drone-pose-topic /<your_ns>/mavros/local_position/pose
+```
+
+
+
+
+
+
+
+ python3 gesture_realtime_hand_deep.py   --mavros-prefix /mavros   --drone-pose-topic /mavros/local_position/pose

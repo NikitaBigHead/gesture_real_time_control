@@ -1,0 +1,89 @@
+OPI Terminal 1 Mavros Launch
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID=42
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+
+# now launch MAVROS here
+# ros2 launch ...
+
+OPI Terminal 2 Inspect topics
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID=42
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+
+ros2 topic list --no-daemon --spin-time 3
+
+OPI Terminal 3 Run velocity script
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID=42
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+
+ros2 run drone remote_velocity_mission
+
+GS Terminal 1 Send Velocity commands
+
+source /opt/ros/humble/setup.bash
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID=42
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+
+ros2 topic pub -r 10 /gesture/setpoint_velocity/cmd_vel geometry_msgs/msg/TwistStamped \
+"{twist: {linear: {x: 0.4, y: 0.0, z: 0.0}, angular: {z: 0.0}}}"
+
+
+SERVO CONTROL:
+
+OPI Terminal 4:
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID=42
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+
+ros2 run drone servo_cmd_bridge
+
+GS Terminal 2:
+
+ros2 topic pub /gesture/servo_cmd std_msgs/msg/String "{data: 's1 2000'}" --once
+ros2 topic pub /gesture/servo_cmd std_msgs/msg/String "{data: 's2 1600'}" --once       # Keep s2 between 1400 and 1600
+
+GESTURE CONTROL USING CAMERA AND THE REPO:
+
+GS TERMINAL 1: run the ground station gesture node
+
+cd ~/gesture_real_time_control
+source .venv/bin/activate
+source /opt/ros/humble/setup.bash
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID=42
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+
+cd deep_control
+python3 gesture_realtime_hand_deep.py \
+  --mavros-prefix /gesture \
+  --drone-pose-topic /drone2/mavros/local_position/pose
+  
+  
+OPI Terminal: run opi terminal 3 from above 
+
+
+
+
+
+
+Changed the topic cmd_vel to body instead of local
+
+ros2 param list /mavros/setpoint_velocity
+ros2 param get /mavros/setpoint_velocity mav_frame
+ros2 param set /mavros/setpoint_velocity mav_frame BODY_NED
+
