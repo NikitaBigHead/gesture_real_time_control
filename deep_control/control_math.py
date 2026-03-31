@@ -103,11 +103,19 @@ def normalize_axis(delta, dead_zone, max_delta):
 def get_control_vector(current_xyz, origin_xyz):
     cur_x, cur_y, cur_z = current_xyz
     org_x, org_y, org_z = origin_xyz
-    return (
-        normalize_axis(cur_x - org_x, XY_DEAD_ZONE, XY_MAX_DELTA),
-        normalize_axis(cur_y - org_y, XY_DEAD_ZONE, XY_MAX_DELTA),
-        normalize_axis(cur_z - org_z, Z_DEAD_ZONE, Z_MAX_DELTA),
-    )
+
+    vx = normalize_axis(cur_x - org_x, XY_DEAD_ZONE, XY_MAX_DELTA)
+    vy = normalize_axis(cur_y - org_y, XY_DEAD_ZONE, XY_MAX_DELTA)
+    vz = normalize_axis(cur_z - org_z, Z_DEAD_ZONE, Z_MAX_DELTA)
+
+    vec = [vx, vy, vz]
+    max_idx = max(range(3), key=lambda i: abs(vec[i]))
+
+    result = [0.0, 0.0, 0.0]
+    result[max_idx] = vec[max_idx]
+
+    return tuple(result)
+
 
 
 def get_movement_directions(current_xyz, origin_xyz):

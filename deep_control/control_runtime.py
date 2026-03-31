@@ -17,8 +17,14 @@ from control_commands import (
     log_command_events,
     reset_command_tracker_state,
 )
+from control_config import COMMAND_MISSING_SLOT_HOLD_FRAMES
 from control_overlay import draw_control_overlay, draw_hand_skeleton
-from control_state import compute_frame_control_state, create_tracking_state, reset_tracking_state
+from control_state import (
+    FrameControlState,
+    compute_frame_control_state,
+    create_tracking_state,
+    reset_tracking_state,
+)
 from gesture_drone_node import GestureDroneController
 
 
@@ -114,6 +120,7 @@ def run_realtime_gesture_detection(model_path, pose_model_path, camera_id, show_
     align = rs.align(rs.stream.color)
 
     last_timestamp_ms = 0
+    no_hand_frames = 0
     tracking_state = create_tracking_state()
     command_state = create_command_tracker_state()
     drone_controller = None
@@ -172,6 +179,7 @@ def run_realtime_gesture_detection(model_path, pose_model_path, camera_id, show_
             pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
 
             if result.hand_landmarks:
+                no_hand_frames = 0
                 frame_state = compute_frame_control_state(
                     result,
                     pose_result,
@@ -189,8 +197,23 @@ def run_realtime_gesture_detection(model_path, pose_model_path, camera_id, show_
                 draw_hand_skeleton(frame_bgr, result.hand_landmarks)
                 draw_control_overlay(frame_bgr, frame_state)
             else:
-                reset_tracking_state(tracking_state)
-                reset_command_tracker_state(command_state)
+                no_hand_frames += 1
+                empty_frame_state = FrameControlState(
+                    active_hand_slot=None,
+                    active_hand_index=None,
+                    hands=[],
+                )
+                command_events = collect_command_events(
+                    empty_frame_state,
+                    command_state,
+                    timestamp_ms,
+                )
+                log_command_events(command_events)
+                if drone_controller is not None and command_events:
+                    drone_controller.handle_events(command_events)
+                if no_hand_frames >= COMMAND_MISSING_SLOT_HOLD_FRAMES:
+                    reset_tracking_state(tracking_state)
+                    reset_command_tracker_state(command_state)
 
             cv2.imshow("Real-time Gesture Detection", frame_bgr)
             if show_depth:
