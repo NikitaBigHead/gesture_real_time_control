@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +25,8 @@ DEFAULT_MIN_GESTURE_SCORE = 0.5
 DEFAULT_FRAME_WIDTH = 640
 DEFAULT_FRAME_HEIGHT = 480
 DEFAULT_FPS = 30
+DEFAULT_INITIAL_MEAN_WINDOW = 5
+DEFAULT_GESTURE_HOLD_SEC = 0.35
 STATE_LEFT = "left"
 STATE_RIGHT = "right"
 STATE_NONE = "none"
@@ -47,6 +50,10 @@ def default_model_path() -> str:
 
 def clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(value, hi))
+
+
+def mean_int(values: deque[int]) -> int:
+    return int(round(sum(values) / len(values)))
 
 
 def get_thumb_up_hand_index(
@@ -165,6 +172,8 @@ def run_gesture_scrolling(
     camera_id: int,
     zone_width_px: int,
     min_gesture_score: float,
+    initial_mean_window: int,
+    gesture_hold_sec: float,
 ) -> None:
     if rs is None:
         raise RuntimeError("pyrealsense2 is not installed. Install the RealSense SDK Python package first.")
@@ -200,6 +209,10 @@ def run_gesture_scrolling(
     last_state: Optional[str] = STATE_NONE
     last_timestamp_ms = 0
     pipeline_started = False
+    initial_pose_samples: deque[int] = deque(maxlen=max(1, initial_mean_window))
+    initial_pose_locked = False
+    last_seen_monotonic: Optional[float] = None
+    last_thumb_x_px: Optional[int] = None
 
     try:
         pipeline.start(config)
@@ -229,19 +242,49 @@ def run_gesture_scrolling(
 
             state = STATE_NONE
             thumb_x_px: Optional[int] = None
+            now = time.monotonic()
 
             thumb_up_index = get_thumb_up_hand_index(result, min_gesture_score)
             if thumb_up_index is None:
-                zone_left_px = None
-                zone_right_px = None
+                if (
+                    last_seen_monotonic is not None
+                    and now - last_seen_monotonic <= gesture_hold_sec
+                    and zone_left_px is not None
+                    and zone_right_px is not None
+                    and last_thumb_x_px is not None
+                ):
+                    thumb_x_px = last_thumb_x_px
+                    state = resolve_state(thumb_x_px, zone_left_px, zone_right_px)
+                else:
+                    initial_pose_samples.clear()
+                    initial_pose_locked = False
+                    last_seen_monotonic = None
+                    last_thumb_x_px = None
+                    zone_left_px = None
+                    zone_right_px = None
             else:
                 thumb_x_px = get_thumb_tip_x_px(result, thumb_up_index, frame_width)
-                if zone_left_px is None or zone_right_px is None:
+                last_thumb_x_px = thumb_x_px
+                last_seen_monotonic = now
+
+                if not initial_pose_locked:
+                    initial_pose_samples.append(thumb_x_px)
+                    center_x_px = mean_int(initial_pose_samples)
                     zone_left_px, zone_right_px = compute_zone_bounds(
-                        center_x_px=thumb_x_px,
+                        center_x_px=center_x_px,
                         zone_width_px=zone_width_px,
                         frame_width=frame_width,
                     )
+                    if len(initial_pose_samples) >= initial_pose_samples.maxlen:
+                        initial_pose_locked = True
+                elif zone_left_px is None or zone_right_px is None:
+                    center_x_px = thumb_x_px
+                    zone_left_px, zone_right_px = compute_zone_bounds(
+                        center_x_px=center_x_px,
+                        zone_width_px=zone_width_px,
+                        frame_width=frame_width,
+                    )
+
                 state = resolve_state(thumb_x_px, zone_left_px, zone_right_px)
 
             last_state = print_state_if_changed(state, last_state)
@@ -284,6 +327,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MIN_GESTURE_SCORE,
         help="Minimum Thumb_Up confidence",
     )
+    parser.add_argument(
+        "--initial-mean-window",
+        type=int,
+        default=DEFAULT_INITIAL_MEAN_WINDOW,
+        help="Number of first Thumb_Up frames to average for the initial zone anchor",
+    )
+    parser.add_argument(
+        "--gesture-hold-sec",
+        type=float,
+        default=DEFAULT_GESTURE_HOLD_SEC,
+        help="How long to keep the last state after Thumb_Up briefly disappears",
+    )
     return parser.parse_args()
 
 
@@ -294,6 +349,8 @@ def main() -> None:
         camera_id=args.camera_id,
         zone_width_px=args.zone_width,
         min_gesture_score=args.min_score,
+        initial_mean_window=args.initial_mean_window,
+        gesture_hold_sec=args.gesture_hold_sec,
     )
 
 
