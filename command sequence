@@ -37,7 +37,7 @@ export ROS_DOMAIN_ID=42
 export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 
 ros2 topic pub -r 10 /gesture/setpoint_velocity/cmd_vel geometry_msgs/msg/TwistStamped \
-"{twist: {linear: {x: 0.4, y: 0.0, z: 0.0}, angular: {z: 0.0}}}"
+"{twist: {linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {z: 0.4}}}"
 
 
 SERVO CONTROL:
@@ -75,6 +75,30 @@ python3 gesture_realtime_hand_deep.py \
   
   
 OPI Terminal: run opi terminal 3 from above 
+
+
+VOICE CONTROL:
+
+OPI Terminal: Run the voice command bridge node
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID=42
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+
+ros2 run drone voice_command_mission
+
+GS Terminal: Run Local Voice processing script
+
+cd ~/gesture_real_time_control
+source .venv/bin/activate
+source /opt/ros/humble/setup.bash
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID=42
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+
+python3 realtime_asr_vad_pyaudio.py --mic-id 7 --input-rate 48000 --whisper-model small
 
 
 

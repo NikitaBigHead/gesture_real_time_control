@@ -1,24 +1,32 @@
 """
-Real-time microphone ASR with PyAudio, Silero VAD, and Hugging Face Whisper.
+Real-time microphone ASR with PyAudio, Silero VAD, Hugging Face Whisper,
+and Ollama-based drone command extraction.
 
 Reads audio from a local microphone, segments phrases with Silero VAD,
-transcribes them with Whisper from Hugging Face, and prints recognized
-speech to the console.
+transcribes them with Whisper from Hugging Face, and optionally sends the
+recognized text to Ollama so it can be converted into structured drone
+commands.
 
 Suggested packages:
-    pip install pyaudio silero-vad transformers torch
+    pip install pyaudio silero-vad transformers torch requests
 """
 
 from __future__ import annotations
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
 
 import argparse
+import ast
+import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from collections import deque
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -42,12 +50,38 @@ try:
 except ImportError:
     load_silero_vad = None
 
+try:
+    from olama_client import (
+        DEFAULT_BASE_URL as DEFAULT_OLLAMA_HOST,
+        DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL,
+        DEFAULT_TIMEOUT_SEC as DEFAULT_OLLAMA_TIMEOUT_SEC,
+        send_prompt as send_ollama_prompt,
+    )
+except ImportError:
+    # DEFAULT_OLLAMA_HOST = "http://192.168.50.26:11434"
+    DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+    DEFAULT_OLLAMA_MODEL = "qwen3.5:2b"
+    DEFAULT_OLLAMA_TIMEOUT_SEC = 120
+    send_ollama_prompt = None
+
 
 MODEL_AUDIO_RATE = 16000
 DEFAULT_INPUT_RATE = 48000
 DEFAULT_CHUNK = 1024
 SILERO_WINDOW_SAMPLES = 512
 DEFAULT_WHISPER_MODEL = "openai/whisper-medium"
+ALLOWED_DRONE_COMMANDS = {
+    "forward",
+    "backward",
+    "up",
+    "down",
+    "left",
+    "right",
+    "turn right",
+    "turn left",
+}
+ROTATION_COMMANDS = {"turn right", "turn left"}
+_NULL_STRINGS = {"", "none", "null"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,6 +126,143 @@ def normalize_whisper_model_name(model_name: str) -> str:
         return model_name
 
     return f"openai/whisper-{model_name}"
+
+
+def normalize_optional_number(value: Any) -> Optional[int | float]:
+    if value is None or isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        text = value.strip().lower()
+        if text in _NULL_STRINGS:
+            return None
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        number = float(match.group(0))
+    else:
+        return None
+
+    return int(number) if number.is_integer() else number
+
+
+def normalize_drone_command(command: Any) -> Optional[str]:
+    if command is None:
+        return None
+    if not isinstance(command, str):
+        return None
+
+    normalized = " ".join(command.strip().lower().split())
+    if normalized in _NULL_STRINGS:
+        return None
+
+    alias_map = {
+        "move forward": "forward",
+        "go forward": "forward",
+        "move backward": "backward",
+        "go backward": "backward",
+        "move up": "up",
+        "go up": "up",
+        "move down": "down",
+        "go down": "down",
+        "move left": "left",
+        "go left": "left",
+        "move right": "right",
+        "go right": "right",
+        "rotate right": "turn right",
+        "rotate left": "turn left",
+    }
+    normalized = alias_map.get(normalized, normalized)
+    if normalized not in ALLOWED_DRONE_COMMANDS:
+        return None
+    return normalized
+
+
+class DroneCommandExtractor:
+    def __init__(self, ollama_host: str, ollama_model: str, timeout_sec: int):
+        if send_ollama_prompt is None:
+            raise RuntimeError("Ollama client is unavailable. Make sure requests is installed.")
+
+        self._ollama_host = ollama_host
+        self._ollama_model = ollama_model
+        self._timeout_sec = timeout_sec
+
+    def extract(self, transcript: str) -> dict[str, Optional[str | int | float]]:
+        raw_response = send_ollama_prompt(
+            prompt=self._build_prompt(transcript),
+            base_url=self._ollama_host,
+            model=self._ollama_model,
+            timeout_sec=self._timeout_sec,
+        )
+        return self._normalize_payload(self._parse_response(raw_response))
+
+    def _build_prompt(self, transcript: str) -> str:
+        return (
+            "You convert recognized speech into a structured drone command.\n"
+            "Allowed commands: forward, backward, up, down, left, right, turn right, turn left.\n"
+            "Return JSON only with exactly these keys: command, distance, angle.\n"
+            "Rules:\n"
+            '- "command" must be one of the allowed commands or null if no drone command is present.\n'
+            '- "distance" must be a number only when the user explicitly gives a movement distance; otherwise null.\n'
+            '- "angle" must be a number in degrees only when the user explicitly gives a turn angle; otherwise null.\n'
+            "- Do not invent a distance or angle if the phrase does not define one.\n"
+            "- For forward/backward/up/down/left/right commands, angle must be null.\n"
+            "- For turn right/turn left commands, distance must be null.\n"
+            "- Convert written numbers to numerals.\n"
+            "- Output JSON only, with no markdown and no explanation.\n\n"
+            f"Recognized phrase: {json.dumps(transcript, ensure_ascii=True)}"
+        )
+
+    def _parse_response(self, response_text: str) -> dict[str, Any]:
+        text = response_text.strip()
+        if not text:
+            raise RuntimeError("Ollama returned an empty response.")
+
+        candidates = [text]
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match and match.group(0) not in candidates:
+            candidates.append(match.group(0))
+
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate)
+                if isinstance(payload, dict):
+                    return payload
+            except json.JSONDecodeError:
+                pass
+
+            try:
+                payload = ast.literal_eval(candidate)
+                if isinstance(payload, dict):
+                    return payload
+            except (SyntaxError, ValueError):
+                pass
+
+        raise RuntimeError(f"Could not parse Ollama response as a dict: {response_text}")
+
+    def _normalize_payload(self, payload: dict[str, Any]) -> dict[str, Optional[str | int | float]]:
+        command = normalize_drone_command(payload.get("command"))
+        distance = normalize_optional_number(payload.get("distance"))
+        angle = normalize_optional_number(payload.get("angle"))
+
+        if distance is not None:
+            distance = min(distance, 2)
+
+        if command in ROTATION_COMMANDS:
+            distance = None
+        elif command in ALLOWED_DRONE_COMMANDS:
+            angle = None
+        else:
+            distance = None
+            angle = None
+
+        return {
+            "command": command,
+            "distance": distance,
+            "angle": angle,
+        }
 
 
 class AudioRateConverter:
@@ -202,8 +373,13 @@ class RealTimeMicAsr:
         language: Optional[str],
         vad_threshold: float,
         phrase_end_delay_sec: float,
+        ollama_host: str,
+        ollama_model: str,
+        ollama_timeout_sec: int,
+        enable_drone_commands: bool = True,
         pre_roll_sec: float = 0.35,
         min_phrase_sec: float = 0.30,
+        on_drone_command=None,
     ):
         missing = []
         if pyaudio is None:
@@ -224,6 +400,7 @@ class RealTimeMicAsr:
         self._phrase_end_delay_sec = phrase_end_delay_sec
         self._min_phrase_samples = int(min_phrase_sec * MODEL_AUDIO_RATE)
         self._pre_roll_chunks = max(1, int(pre_roll_sec * input_rate / frames_per_buffer))
+        self._on_drone_command = on_drone_command
 
         self._converter = AudioRateConverter(input_rate, MODEL_AUDIO_RATE)
         self._pre_roll: deque[np.ndarray] = deque(maxlen=self._pre_roll_chunks)
@@ -241,15 +418,39 @@ class RealTimeMicAsr:
         self._whisper_pipeline = None
         self._torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         self._pipeline_device = 0 if torch.cuda.is_available() else -1
+        self._drone_command_extractor: Optional[DroneCommandExtractor] = None
 
-        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=8)
-        self._stop = threading.Event()
-        self._worker = threading.Thread(
+        self._transcription_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue()
+        self._command_queue: queue.Queue[Optional[str]] = queue.Queue()
+        self._transcription_worker_thread = threading.Thread(
             target=self._transcription_worker,
             daemon=True,
             name="HuggingFaceWhisperWorker",
         )
-        self._worker.start()
+        self._command_worker_thread: Optional[threading.Thread] = None
+
+        if enable_drone_commands:
+            self._drone_command_extractor = DroneCommandExtractor(
+                ollama_host=ollama_host,
+                ollama_model=ollama_model,
+                timeout_sec=ollama_timeout_sec,
+            )
+            self._command_worker_thread = threading.Thread(
+                target=self._command_worker,
+                daemon=True,
+                name="OllamaDroneCommandWorker",
+            )
+            log.info(
+                "Drone command extraction enabled: host=%s model=%s",
+                ollama_host,
+                ollama_model,
+            )
+        else:
+            log.info("Drone command extraction disabled.")
+
+        self._transcription_worker_thread.start()
+        if self._command_worker_thread is not None:
+            self._command_worker_thread.start()
 
         log.info(
             "ASR ready: input_rate=%dHz -> %dHz, chunk=%d, HuggingFace Whisper=%s",
@@ -322,10 +523,7 @@ class RealTimeMicAsr:
             "Phrase captured: %.2f sec. Transcribing...",
             utterance.size / MODEL_AUDIO_RATE,
         )
-        try:
-            self._queue.put_nowait(utterance)
-        except queue.Full:
-            log.warning("Dropping phrase because transcription queue is full.")
+        self._transcription_queue.put_nowait(utterance)
 
     def _reset_phrase_state(self, reset_vad: bool = False) -> None:
         self._phrase_chunks = []
@@ -337,12 +535,8 @@ class RealTimeMicAsr:
             self._vad_model.reset_states()
 
     def _transcription_worker(self) -> None:
-        while not self._stop.is_set():
-            try:
-                utterance = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
+        while True:
+            utterance = self._transcription_queue.get()
             if utterance is None:
                 break
 
@@ -350,6 +544,7 @@ class RealTimeMicAsr:
                 text = self._transcribe(utterance)
                 if text:
                     print(f"[ASR] {text}", flush=True)
+                    self._enqueue_drone_command(text)
             except Exception as exc:
                 log.error("Hugging Face Whisper transcription failed: %s", exc)
 
@@ -373,17 +568,90 @@ class RealTimeMicAsr:
         )
         return result.get("text", "").strip()
 
+    def _enqueue_drone_command(self, transcript: str) -> None:
+        if self._command_worker_thread is None:
+            return
+        self._command_queue.put_nowait(transcript)
+
+    def _command_worker(self) -> None:
+        while True:
+            transcript = self._command_queue.get()
+            if transcript is None:
+                break
+
+            self._emit_drone_command(transcript)
+
+    # def _emit_drone_command(self, transcript: str) -> None:
+    #     if self._drone_command_extractor is None:
+    #         return
+
+    #     try:
+    #         command_dict = self._drone_command_extractor.extract(transcript)
+    #         print(f"[DRONE_CMD] {command_dict}", flush=True)
+    #     except Exception as exc:
+    #         log.error("Ollama command extraction failed: %s", exc)
+
+    def _emit_drone_command(self, transcript: str) -> None:
+        if self._drone_command_extractor is not None:
+            try:
+                command_dict = self._drone_command_extractor.extract(transcript)
+                print(f"[DRONE_CMD] {command_dict}", flush=True)
+                if command_dict.get("command") is not None and self._on_drone_command is not None:
+                    self._on_drone_command(command_dict)
+                return
+            except Exception as exc:
+                log.error("Ollama command extraction failed: %s", exc)
+
+        text = transcript.lower()
+
+        fallback = None
+        if "forward" in text:
+            fallback = {"command": "forward", "distance": 1, "angle": None}
+        elif "backward" in text or "backwards" in text:
+            fallback = {"command": "backward", "distance": 1, "angle": None}
+        elif "left" in text and "turn" in text:
+            fallback = {"command": "turn left", "distance": None, "angle": 45}
+        elif "right" in text and "turn" in text:
+            fallback = {"command": "turn right", "distance": None, "angle": 45}
+
+        if fallback is not None:
+            print(f"[DRONE_CMD_FALLBACK] {fallback}", flush=True)
+            if self._on_drone_command is not None:
+                self._on_drone_command(fallback)
+                
+
+
     def close(self) -> None:
         if self._phrase_active and self._phrase_chunks:
             self._finalize_phrase()
 
-        self._stop.set()
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            pass
-        self._worker.join(timeout=5.0)
+        self._transcription_queue.put_nowait(None)
+        self._transcription_worker_thread.join(timeout=5.0)
 
+        if self._command_worker_thread is not None:
+            self._command_queue.put_nowait(None)
+            self._command_worker_thread.join(timeout=5.0)
+
+class VoiceCommandPublisher(Node):
+    def __init__(self):
+        super().__init__('voice_command_publisher')
+        self.pub = self.create_publisher(String, '/voice/drone_command', 10)
+        self._queue = queue.Queue()
+        self.create_timer(0.05, self._flush_queue)
+        self.get_logger().info('Voice command publisher started')
+
+    def enqueue_command(self, command_dict):
+        self._queue.put(command_dict)
+
+    def _flush_queue(self):
+        while not self._queue.empty():
+            command_dict = self._queue.get()
+            if command_dict.get('command') is None:
+                continue
+            msg = String()
+            msg.data = json.dumps(command_dict)
+            self.pub.publish(msg)
+            self.get_logger().info(f'Published voice command: {msg.data}')
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Real-time microphone ASR with VAD")
@@ -431,17 +699,86 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--phrase-end-delay-sec",
         type=float,
-        default=1.2,
+        default=0.5,
         help="Seconds of silence before a phrase is finalized",
+    )
+    parser.add_argument(
+        "--disable-ollama",
+        action="store_true",
+        help="Disable Ollama command extraction and only print ASR text.",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        type=str,
+        default=DEFAULT_OLLAMA_HOST,
+        help=f"Ollama server URL. Default: {DEFAULT_OLLAMA_HOST}",
+    )
+    parser.add_argument(
+        "--ollama-model",
+        type=str,
+        default=DEFAULT_OLLAMA_MODEL,
+        help=f"Ollama model name. Default: {DEFAULT_OLLAMA_MODEL}",
+    )
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        default=DEFAULT_OLLAMA_TIMEOUT_SEC,
+        help=f"Ollama request timeout in seconds. Default: {DEFAULT_OLLAMA_TIMEOUT_SEC}",
     )
     return parser.parse_args()
 
+
+# def main() -> None:
+#     args = parse_args()
+#     if args.list_devices:
+#         list_input_devices()
+#         return
+
+#     asr = RealTimeMicAsr(
+#         input_rate=args.input_rate,
+#         frames_per_buffer=args.frames_per_buffer,
+#         whisper_model_name=args.whisper_model,
+#         language=args.language or None,
+#         vad_threshold=args.vad_threshold,
+#         phrase_end_delay_sec=args.phrase_end_delay_sec,
+#         ollama_host=args.ollama_host,
+#         ollama_model=args.ollama_model,
+#         ollama_timeout_sec=args.ollama_timeout,
+#         enable_drone_commands=not args.disable_ollama,
+#     )
+#     pa = None
+#     stream = None
+
+#     try:
+#         pa, stream = open_microphone_stream(
+#             microphone_device_id=args.mic_id,
+#             input_rate=args.input_rate,
+#             frames_per_buffer=args.frames_per_buffer,
+#         )
+#         log.info("Listening... Press Ctrl+C to stop.")
+#         while True:
+#             raw = stream.read(args.frames_per_buffer, exception_on_overflow=False)
+#             asr.process_raw_audio(raw)
+#     except KeyboardInterrupt:
+#         log.info("Stopping...")
+#     finally:
+#         asr.close()
+#         if stream is not None:
+#             stream.stop_stream()
+#             stream.close()
+#         if pa is not None:
+#             pa.terminate()
 
 def main() -> None:
     args = parse_args()
     if args.list_devices:
         list_input_devices()
         return
+
+    rclpy.init()
+    ros_node = VoiceCommandPublisher()
+    ros_spin_thread = threading.Thread(target=rclpy.spin, args=(ros_node,), daemon=True)
+    ros_spin_thread.start()
 
     asr = RealTimeMicAsr(
         input_rate=args.input_rate,
@@ -450,7 +787,13 @@ def main() -> None:
         language=args.language or None,
         vad_threshold=args.vad_threshold,
         phrase_end_delay_sec=args.phrase_end_delay_sec,
+        ollama_host=args.ollama_host,
+        ollama_model=args.ollama_model,
+        ollama_timeout_sec=args.ollama_timeout,
+        enable_drone_commands=not args.disable_ollama,
+        on_drone_command=ros_node.enqueue_command,
     )
+
     pa = None
     stream = None
 
@@ -473,7 +816,8 @@ def main() -> None:
             stream.close()
         if pa is not None:
             pa.terminate()
-
+        ros_node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
