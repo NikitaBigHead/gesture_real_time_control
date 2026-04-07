@@ -89,6 +89,8 @@ def compute_zone_bounds(center_x_px: int, zone_width_px: int, frame_width: int) 
 
 def resolve_state(current_x_px: int, zone_left_px: int, zone_right_px: int) -> str:
     if zone_left_px <= current_x_px <= zone_right_px:
+        return STATE_NONE
+    if current_x_px < zone_left_px:
         return STATE_LEFT
     return STATE_RIGHT
 

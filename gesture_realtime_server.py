@@ -18,6 +18,7 @@ import argparse
 import logging
 import os
 import queue
+import re
 import struct
 import sys
 import threading
@@ -25,7 +26,7 @@ import time
 from collections import deque
 from pathlib import Path
 from textwrap import wrap
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import mediapipe as mp
@@ -40,6 +41,8 @@ if str(DEEP_CONTROL_DIR) not in sys.path:
     sys.path.insert(0, str(DEEP_CONTROL_DIR))
 
 import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
 
 from control_commands import (
     collect_command_events,
@@ -48,7 +51,7 @@ from control_commands import (
     reset_command_tracker_state,
 )
 from control_config import COMMAND_MISSING_SLOT_HOLD_FRAMES
-from control_overlay import draw_control_overlay, draw_hand_skeleton
+from control_overlay import draw_control_overlay, draw_hand_skeleton, draw_person_bbox
 from control_state import (
     FrameControlState,
     compute_frame_control_state,
@@ -71,6 +74,11 @@ try:
     import whisper
 except ImportError:
     whisper = None
+
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
 
 try:
     from silero_vad import load_silero_vad
@@ -98,6 +106,100 @@ logging.basicConfig(
     format="%(asctime)s [GESTURE_SERVER] %(levelname)s %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+def normalize_voice_command(text: str) -> Optional[str]:
+    normalized = " ".join(text.strip().lower().replace("_", " ").split())
+    if not normalized:
+        return None
+
+    tokens = set(re.findall(r"[a-z]+", normalized))
+    if "land" in tokens:
+        return "land"
+    if "explore" in tokens and "face" in tokens:
+        return "explore_face"
+    if "follow" in tokens:
+        return "follow"
+    if {"stay", "stop", "hover"} & tokens:
+        return "stay"
+    return None
+
+
+class VoiceCommandPublisher(Node):
+    def __init__(self, topic: str):
+        super().__init__("gesture_voice_command_bridge")
+        self._topic = topic
+        self._pub = self.create_publisher(String, topic, 10)
+        self.get_logger().info(f"Voice command publisher ready on {topic}")
+
+    def publish_command(self, command: str, transcript: str) -> None:
+        msg = String()
+        msg.data = command
+        self._pub.publish(msg)
+        self.get_logger().info(
+            f"Published voice command '{command}' from transcript='{transcript}'"
+        )
+
+
+def list_input_microphones() -> None:
+    if pyaudio is None:
+        raise RuntimeError("PyAudio is not installed.")
+
+    pa = pyaudio.PyAudio()
+    try:
+        found = False
+        for index in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(index)
+            if info.get("maxInputChannels", 0) > 0:
+                found = True
+                print(
+                    f"[{index}] {info.get('name', 'Unknown')} | "
+                    f"inputs={info.get('maxInputChannels')} | "
+                    f"default_rate={int(info.get('defaultSampleRate', 0))}"
+                )
+        if not found:
+            print("No input microphones found.")
+    finally:
+        pa.terminate()
+
+
+def open_microphone_stream(microphone_device_id: Optional[int], input_rate: int, frames_per_buffer: int):
+    if pyaudio is None:
+        raise RuntimeError("PyAudio is not installed.")
+
+    pa = pyaudio.PyAudio()
+    if microphone_device_id is not None:
+        info = pa.get_device_info_by_index(microphone_device_id)
+        if info.get("maxInputChannels", 0) <= 0:
+            pa.terminate()
+            raise RuntimeError(f"Device {microphone_device_id} has no input channels.")
+        device_index = microphone_device_id
+        log.info("Using local microphone [%d] %s", device_index, info.get("name", "Unknown"))
+    else:
+        device_index = None
+        for index in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(index)
+            if info.get("maxInputChannels", 0) > 0:
+                device_index = index
+                log.info(
+                    "Using first available local microphone [%d] %s",
+                    index,
+                    info.get("name", "Unknown"),
+                )
+                break
+        if device_index is None:
+            pa.terminate()
+            raise RuntimeError("No input microphone was found.")
+
+    stream = pa.open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=input_rate,
+        input=True,
+        input_device_index=device_index,
+        frames_per_buffer=frames_per_buffer,
+    )
+    return pa, stream
 
 
 def first_existing_path(*candidates: Path) -> str:
@@ -194,6 +296,7 @@ class AudioSpeechPipeline:
         language: Optional[str],
         vad_threshold: float,
         end_delay_sec: float,
+        on_phrase: Optional[Callable[[str], None]] = None,
         pre_roll_sec: float = 0.35,
         min_phrase_sec: float = 0.30,
     ):
@@ -223,6 +326,7 @@ class AudioSpeechPipeline:
         self._phrase_lock = threading.Lock()
         self._latest_phrase = ""
         self._latest_phrase_monotonic: Optional[float] = None
+        self._on_phrase = on_phrase
         self._use_speech_recognition_backend = (
             sr is not None
             and whisper is not None
@@ -361,6 +465,11 @@ class AudioSpeechPipeline:
                         self._latest_phrase = text
                         self._latest_phrase_monotonic = time.monotonic()
                     log.info("[Speech] %s", text)
+                    if self._on_phrase is not None:
+                        try:
+                            self._on_phrase(text)
+                        except Exception as exc:
+                            log.error("Voice command callback failed: %s", exc)
             except Exception as exc:
                 log.error("Audio transcription failed: %s", exc)
 
@@ -429,10 +538,15 @@ class GestureServerRuntime:
 
         self._drone_controller = None
         self._drone_spin_thread = None
+        self._voice_command_publisher = None
         self._owns_rclpy = False
+        self._last_voice_command = ""
+        self._last_voice_command_monotonic = 0.0
 
         self._recognizer = self._create_gesture_recognizer(args.model, args.use_gpu)
         self._pose_landmarker = self._create_pose_landmarker(args.pose_model, args.use_gpu)
+        if not args.disable_voice_command_pub:
+            self._start_voice_command_publisher()
         self._audio = AudioSpeechPipeline(
             enabled=not args.disable_audio_recognition,
             input_sample_rate=args.audio_input_rate,
@@ -440,6 +554,7 @@ class GestureServerRuntime:
             language=args.audio_language or None,
             vad_threshold=args.vad_threshold,
             end_delay_sec=args.vad_end_delay_sec,
+            on_phrase=self._handle_detected_phrase,
         )
 
         if not args.no_drone_control:
@@ -474,10 +589,13 @@ class GestureServerRuntime:
         )
         return vision.PoseLandmarker.create_from_options(options)
 
-    def _start_drone_controller(self) -> None:
+    def _ensure_rclpy(self) -> None:
         if not rclpy.ok():
             rclpy.init(args=None)
             self._owns_rclpy = True
+
+    def _start_drone_controller(self) -> None:
+        self._ensure_rclpy()
 
         self._drone_controller = GestureDroneController(
             mavros_prefix=self.args.mavros_prefix,
@@ -502,6 +620,34 @@ class GestureServerRuntime:
             self._drone_controller.cmd_vel_topic,
             self._drone_controller.pose_topic,
         )
+
+    def _start_voice_command_publisher(self) -> None:
+        self._ensure_rclpy()
+        self._voice_command_publisher = VoiceCommandPublisher(self.args.voice_command_topic)
+
+    def _handle_detected_phrase(self, phrase: str) -> None:
+        if self._voice_command_publisher is None:
+            return
+
+        command = normalize_voice_command(phrase)
+        if command is None:
+            return
+
+        now = time.monotonic()
+        if (
+            command == self._last_voice_command
+            and now - self._last_voice_command_monotonic < self.args.voice_command_min_repeat_sec
+        ):
+            log.info(
+                "Skipping duplicate voice command '%s' (cooldown %.1fs)",
+                command,
+                self.args.voice_command_min_repeat_sec,
+            )
+            return
+
+        self._voice_command_publisher.publish_command(command, phrase)
+        self._last_voice_command = command
+        self._last_voice_command_monotonic = now
 
     def _next_timestamp_ms(self) -> int:
         timestamp_ms = int(time.time() * 1000)
@@ -597,6 +743,7 @@ class GestureServerRuntime:
 
         result = self._recognizer.recognize_for_video(mp_image, timestamp_ms)
         pose_result = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+        draw_person_bbox(frame, pose_result)
 
         if result.hand_landmarks:
             self._no_hand_frames = 0
@@ -642,7 +789,6 @@ class GestureServerRuntime:
         if self.args.no_display:
             return
 
-        self._draw_detected_phrase(frame)
         cv2.imshow("Gesture Realtime Server", frame)
         if frame_depth_colormap is not None:
             cv2.imshow("Depth", frame_depth_colormap)
@@ -654,6 +800,9 @@ class GestureServerRuntime:
     def should_stop(self) -> bool:
         return self._stop_requested.is_set()
 
+    def request_stop(self) -> None:
+        self._stop_requested.set()
+
     def close(self) -> None:
         self._audio.close()
 
@@ -662,10 +811,13 @@ class GestureServerRuntime:
                 self._drone_controller.send_velocity_command(0.0, 0.0, 0.0, 0.0)
             finally:
                 self._drone_controller.destroy_node()
-                if self._owns_rclpy and rclpy.ok():
-                    rclpy.shutdown()
-                if self._drone_spin_thread is not None:
-                    self._drone_spin_thread.join(timeout=1.0)
+        if self._voice_command_publisher is not None:
+            self._voice_command_publisher.destroy_node()
+            self._voice_command_publisher = None
+        if self._owns_rclpy and rclpy.ok():
+            rclpy.shutdown()
+        if self._drone_spin_thread is not None:
+            self._drone_spin_thread.join(timeout=1.0)
 
         self._recognizer.close()
         self._pose_landmarker.close()
@@ -786,6 +938,56 @@ class AudioReceiver(threading.Thread):
         self._sock.close()
 
 
+class LocalAudioReceiver(threading.Thread):
+    def __init__(
+        self,
+        runtime: GestureServerRuntime,
+        sample_rate: int,
+        frames_per_buffer: int,
+        microphone_device_id: Optional[int],
+    ):
+        super().__init__(daemon=True, name="LocalAudioReceiver")
+        self._runtime = runtime
+        self._sample_rate = sample_rate
+        self._frames_per_buffer = frames_per_buffer
+        self._microphone_device_id = microphone_device_id
+        self._stop = threading.Event()
+        self._stream = None
+        self._pa = None
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        log.info(
+            "LocalAudioReceiver using ground-station microphone at %d Hz (buffer=%d)",
+            self._sample_rate,
+            self._frames_per_buffer,
+        )
+        try:
+            self._pa, self._stream = open_microphone_stream(
+                self._microphone_device_id,
+                self._sample_rate,
+                self._frames_per_buffer,
+            )
+            while not self._stop.is_set() and not self._runtime.should_stop():
+                raw = self._stream.read(
+                    self._frames_per_buffer,
+                    exception_on_overflow=False,
+                )
+                samples = np.frombuffer(raw, dtype=np.int16)
+                self._runtime.process_audio(samples, time.time())
+        except Exception as exc:
+            log.error("LocalAudioReceiver error: %s", exc)
+            self._runtime.request_stop()
+        finally:
+            if self._stream is not None:
+                self._stream.stop_stream()
+                self._stream.close()
+            if self._pa is not None:
+                self._pa.terminate()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ZMQ gesture server with ROS control")
     parser.add_argument("--bind-host", type=str, default=BIND_HOST, help="Bind host")
@@ -838,8 +1040,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mavros-prefix",
         type=str,
-        default="/mavros",
-        help="MAVROS namespace prefix. Use /drone2/mavros for real flight if needed.",
+        default="/gesture",
+        help="Velocity topic prefix. Use /gesture for the bridge node, or a MAVROS namespace for direct publishing.",
     )
     parser.add_argument(
         "--drone-pose-topic",
@@ -896,9 +1098,48 @@ def parse_args() -> argparse.Namespace:
         help="Incoming PCM sample rate from the client. Audio is resampled to 16000 Hz for VAD/Whisper.",
     )
     parser.add_argument(
+        "--use-local-mic",
+        action="store_true",
+        help="Use a microphone attached to the ground station instead of the Orange Pi audio stream",
+    )
+    parser.add_argument(
+        "--list-mics",
+        action="store_true",
+        help="List available local input microphones and exit",
+    )
+    parser.add_argument(
+        "--mic-id",
+        type=int,
+        default=None,
+        help="Local microphone device index for --use-local-mic. Default: first available input.",
+    )
+    parser.add_argument(
+        "--mic-frames-per-buffer",
+        type=int,
+        default=AUDIO_CHUNK,
+        help="PyAudio frames_per_buffer when using --use-local-mic",
+    )
+    parser.add_argument(
         "--disable-audio-recognition",
         action="store_true",
         help="Disable audio VAD/transcription",
+    )
+    parser.add_argument(
+        "--disable-voice-command-pub",
+        action="store_true",
+        help="Do not publish recognized voice commands to ROS",
+    )
+    parser.add_argument(
+        "--voice-command-topic",
+        type=str,
+        default="/voice_cmd",
+        help="ROS topic for canonical voice commands such as stay/follow/explore_face/land",
+    )
+    parser.add_argument(
+        "--voice-command-min-repeat-sec",
+        type=float,
+        default=1.5,
+        help="Minimum time before publishing the same canonical voice command again",
     )
     parser.add_argument(
         "--whisper-model",
@@ -929,6 +1170,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.list_mics:
+        list_input_microphones()
+        return
+
     log.info("=== ZMQ Gesture Realtime Server ===")
     log.info(
         "Ports: RGB=%d Depth=%d Audio=%d | MAVROS prefix=%s",
@@ -937,14 +1182,31 @@ def main() -> None:
         args.port_audio,
         args.mavros_prefix,
     )
+    if args.no_drone_control:
+        log.info("Drone control publishing is disabled (--no-drone-control). No /.../setpoint_velocity/cmd_vel topic will be created by this server.")
+    else:
+        log.info(
+            "Remote velocity commands will be published on %s/setpoint_velocity/cmd_vel",
+            args.mavros_prefix,
+        )
 
     ctx = zmq.Context()
     runtime = GestureServerRuntime(args)
     receivers = [
         RGBReceiver(ctx, runtime, args.bind_host, args.port_rgb),
         DepthReceiver(ctx, runtime, args.bind_host, args.port_depth),
-        AudioReceiver(ctx, runtime, args.bind_host, args.port_audio),
     ]
+    if args.use_local_mic:
+        receivers.append(
+            LocalAudioReceiver(
+                runtime,
+                sample_rate=args.audio_input_rate,
+                frames_per_buffer=args.mic_frames_per_buffer,
+                microphone_device_id=args.mic_id,
+            )
+        )
+    else:
+        receivers.append(AudioReceiver(ctx, runtime, args.bind_host, args.port_audio))
 
     for receiver in receivers:
         receiver.start()

@@ -3,6 +3,74 @@ import cv2
 from control_config import HAND_CONNECTIONS
 
 
+def _get_pose_bbox(pose_result, width, height, min_landmarks=6):
+    if not pose_result or not pose_result.pose_landmarks:
+        return None
+    if not pose_result.pose_landmarks[0]:
+        return None
+
+    xs = []
+    ys = []
+    for landmark in pose_result.pose_landmarks[0]:
+        visibility = getattr(landmark, "visibility", None)
+        presence = getattr(landmark, "presence", None)
+        if visibility is not None and visibility < 0.4:
+            continue
+        if presence is not None and presence < 0.4:
+            continue
+        if not (0.0 <= landmark.x <= 1.0 and 0.0 <= landmark.y <= 1.0):
+            continue
+        xs.append(int(landmark.x * width))
+        ys.append(int(landmark.y * height))
+
+    if len(xs) < min_landmarks or len(ys) < min_landmarks:
+        return None
+
+    min_x = max(0, min(xs))
+    min_y = max(0, min(ys))
+    max_x = min(width - 1, max(xs))
+    max_y = min(height - 1, max(ys))
+    if min_x >= max_x or min_y >= max_y:
+        return None
+
+    pad_x = max(12, int((max_x - min_x) * 0.12))
+    pad_y = max(12, int((max_y - min_y) * 0.12))
+    return (
+        max(0, min_x - pad_x),
+        max(0, min_y - pad_y),
+        min(width - 1, max_x + pad_x),
+        min(height - 1, max_y + pad_y),
+    )
+
+
+def draw_person_bbox(image_bgr, pose_result, label="person (pose)"):
+    h, w, _ = image_bgr.shape
+    bbox = _get_pose_bbox(pose_result, w, h)
+    if bbox is None:
+        return
+
+    x0, y0, x1, y1 = bbox
+    cv2.rectangle(
+        image_bgr,
+        (x0, y0),
+        (x1, y1),
+        (255, 180, 0),
+        2,
+        cv2.LINE_AA,
+    )
+    text_y = max(24, y0 - 10)
+    cv2.putText(
+        image_bgr,
+        label,
+        (x0, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        (255, 180, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def draw_hand_skeleton(image_bgr, hand_landmarks_list):
     """Draw hand skeleton for all detected hands."""
     h, w, _ = image_bgr.shape

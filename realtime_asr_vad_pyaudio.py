@@ -12,9 +12,6 @@ Suggested packages:
 """
 
 from __future__ import annotations
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String
 
 import argparse
 import ast
@@ -29,6 +26,15 @@ from collections import deque
 from typing import Any, Optional
 
 import numpy as np
+
+try:
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import String
+except ImportError:
+    rclpy = None
+    Node = object
+    String = None
 
 try:
     import pyaudio
@@ -70,6 +76,8 @@ DEFAULT_INPUT_RATE = 48000
 DEFAULT_CHUNK = 1024
 SILERO_WINDOW_SAMPLES = 512
 DEFAULT_WHISPER_MODEL = "openai/whisper-medium"
+DEFAULT_VAD_THRESHOLD = 0.35
+DEFAULT_ENERGY_THRESHOLD_RMS = 250.0
 ALLOWED_DRONE_COMMANDS = {
     "forward",
     "backward",
@@ -380,6 +388,9 @@ class RealTimeMicAsr:
         pre_roll_sec: float = 0.35,
         min_phrase_sec: float = 0.30,
         on_drone_command=None,
+        on_transcript=None,
+        audio_debug: bool = False,
+        energy_threshold_rms: float = DEFAULT_ENERGY_THRESHOLD_RMS,
     ):
         missing = []
         if pyaudio is None:
@@ -401,6 +412,10 @@ class RealTimeMicAsr:
         self._min_phrase_samples = int(min_phrase_sec * MODEL_AUDIO_RATE)
         self._pre_roll_chunks = max(1, int(pre_roll_sec * input_rate / frames_per_buffer))
         self._on_drone_command = on_drone_command
+        self._on_transcript = on_transcript
+        self._audio_debug = audio_debug
+        self._energy_threshold_rms = max(0.0, float(energy_threshold_rms))
+        self._last_audio_debug_monotonic = 0.0
 
         self._converter = AudioRateConverter(input_rate, MODEL_AUDIO_RATE)
         self._pre_roll: deque[np.ndarray] = deque(maxlen=self._pre_roll_chunks)
@@ -484,7 +499,10 @@ class RealTimeMicAsr:
             return
 
         self._pre_roll.append(chunk)
-        speech_detected = self._chunk_contains_speech(chunk)
+        vad_detected = self._chunk_contains_speech(chunk)
+        energy_detected = self._chunk_has_energy(chunk)
+        speech_detected = vad_detected or energy_detected
+        self._maybe_log_audio_debug(chunk, speech_detected, vad_detected, energy_detected)
         now = time.monotonic()
 
         if speech_detected:
@@ -534,6 +552,42 @@ class RealTimeMicAsr:
         if reset_vad and hasattr(self._vad_model, "reset_states"):
             self._vad_model.reset_states()
 
+    def _chunk_has_energy(self, chunk: np.ndarray) -> bool:
+        if chunk.size == 0:
+            return False
+        chunk_f32 = chunk.astype(np.float32)
+        rms = float(np.sqrt(np.mean(np.square(chunk_f32))))
+        return rms >= self._energy_threshold_rms
+
+    def _maybe_log_audio_debug(
+        self,
+        chunk: np.ndarray,
+        speech_detected: bool,
+        vad_detected: bool,
+        energy_detected: bool,
+    ) -> None:
+        if not self._audio_debug:
+            return
+
+        now = time.monotonic()
+        if now - self._last_audio_debug_monotonic < 1.0:
+            return
+
+        chunk_f32 = chunk.astype(np.float32)
+        rms = float(np.sqrt(np.mean(np.square(chunk_f32)))) if chunk_f32.size else 0.0
+        peak = int(np.max(np.abs(chunk))) if chunk.size else 0
+        log.info(
+            "Audio debug: rms=%.1f peak=%d speech=%s vad=%s energy=%s vad_threshold=%.2f energy_threshold_rms=%.1f",
+            rms,
+            peak,
+            "yes" if speech_detected else "no",
+            "yes" if vad_detected else "no",
+            "yes" if energy_detected else "no",
+            self._vad_threshold,
+            self._energy_threshold_rms,
+        )
+        self._last_audio_debug_monotonic = now
+
     def _transcription_worker(self) -> None:
         while True:
             utterance = self._transcription_queue.get()
@@ -542,11 +596,26 @@ class RealTimeMicAsr:
 
             try:
                 text = self._transcribe(utterance)
-                if text:
-                    print(f"[ASR] {text}", flush=True)
-                    self._enqueue_drone_command(text)
             except Exception as exc:
                 log.error("Hugging Face Whisper transcription failed: %s", exc)
+                continue
+
+            if not text:
+                continue
+
+            print(f"[ASR] {text}", flush=True)
+
+            try:
+                if self._on_transcript is not None:
+                    self._on_transcript(text)
+            except Exception as exc:
+                log.error("Transcript callback failed: %s", exc)
+                continue
+
+            try:
+                self._enqueue_drone_command(text)
+            except Exception as exc:
+                log.error("Drone command enqueue failed: %s", exc)
 
     def _transcribe(self, utterance: np.ndarray) -> str:
         if self._whisper_pipeline is None:
@@ -693,8 +762,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vad-threshold",
         type=float,
-        default=0.5,
+        default=DEFAULT_VAD_THRESHOLD,
         help="Silero VAD threshold",
+    )
+    parser.add_argument(
+        "--energy-threshold-rms",
+        type=float,
+        default=DEFAULT_ENERGY_THRESHOLD_RMS,
+        help="Fallback RMS threshold that can trigger phrase capture even if Silero VAD misses speech.",
+    )
+    parser.add_argument(
+        "--audio-debug",
+        action="store_true",
+        help="Print periodic microphone RMS/peak debug info to help diagnose VAD issues.",
     )
     parser.add_argument(
         "--phrase-end-delay-sec",
@@ -792,6 +872,8 @@ def main() -> None:
         ollama_timeout_sec=args.ollama_timeout,
         enable_drone_commands=not args.disable_ollama,
         on_drone_command=ros_node.enqueue_command,
+        audio_debug=args.audio_debug,
+        energy_threshold_rms=args.energy_threshold_rms,
     )
 
     pa = None

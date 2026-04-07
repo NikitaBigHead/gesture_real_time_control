@@ -70,7 +70,7 @@ export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 
 cd deep_control
 python3 gesture_realtime_hand_deep.py \
-  --mavros-prefix /gesture \
+  --mavros-prefix /mavros \
   --drone-pose-topic /drone2/mavros/local_position/pose
   
   
@@ -102,6 +102,30 @@ python3 realtime_asr_vad_pyaudio.py --mic-id 7 --input-rate 48000 --whisper-mode
 
 
 
+GESTURE + AUDIO HUMAN FOllOWER
+
+OPI Terminal 1:
+
+cd HOVERAI_2
+python3 client.py
+
+GS Terminal 1:
+
+cd ~/gesture_real_time_control
+source .venv/bin/activate
+source /opt/ros/humble/setup.bash
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID=42
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+
+## check arguments
+python3 gesture_realtime_server.py \         
+  --use-local-mic \
+  --mic-id <your_headset_mic_id> \
+  --audio-input-rate 48000 \
+  --voice-command-topic /voice_cmd \
+  --no-drone-control
+  --whisper-model small
 
 
 

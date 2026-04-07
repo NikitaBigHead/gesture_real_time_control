@@ -18,7 +18,7 @@ from control_commands import (
     reset_command_tracker_state,
 )
 from control_config import COMMAND_MISSING_SLOT_HOLD_FRAMES
-from control_overlay import draw_control_overlay, draw_hand_skeleton
+from control_overlay import draw_control_overlay, draw_hand_skeleton, draw_person_bbox
 from control_state import (
     FrameControlState,
     compute_frame_control_state,
@@ -177,6 +177,7 @@ def run_realtime_gesture_detection(model_path, pose_model_path, camera_id, show_
 
             result = recognizer.recognize_for_video(mp_image, timestamp_ms)
             pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+            draw_person_bbox(frame_bgr, pose_result)
 
             if result.hand_landmarks:
                 no_hand_frames = 0
