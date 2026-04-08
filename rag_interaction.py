@@ -138,7 +138,7 @@ except Exception as exc:
     DEFAULT_INPUT_RATE = 48000
     MODEL_AUDIO_RATE = 16000
     DEFAULT_VAD_THRESHOLD = 0.35
-    DEFAULT_WHISPER_MODEL = "openai/whisper-medium"
+    DEFAULT_WHISPER_MODEL = "openai/whisper-small"
     RealTimeMicAsr = None
 
     def list_input_devices() -> None:

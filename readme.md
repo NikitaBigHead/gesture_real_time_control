@@ -1,0 +1,2 @@
+
+(.venv) (base) dzmitry@isr-lab:~/gesture_real_time_control$ python rag_interaction.py   --mic-id 3   --gesture-video-source stream   --video-bind-host 0.0.0.0   --video-port 5550   --server-url http://127.0.0.1:8000 --video-preview --model /home/dzmitry/gesture_real_time_control/gesture_recognizer_orig.task --whisper-model openai/whisper-small 
