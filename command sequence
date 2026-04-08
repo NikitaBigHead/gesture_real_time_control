@@ -131,7 +131,17 @@ python3 gesture_realtime_server.py \
 
 Changed the topic cmd_vel to body instead of local
 
-ros2 param list /mavros/setpoint_velocity
-ros2 param get /mavros/setpoint_velocity mav_frame
-ros2 param set /mavros/setpoint_velocity mav_frame BODY_NED
+ros2 param list drone2/mavros/setpoint_velocity
+ros2 param get drone2/mavros/setpoint_velocity mav_frame
+ros2 param set drone2/mavros/setpoint_velocity mav_frame BODY_NED
+
+
+
+CHAIR DISCOVERY MODEL:
+
+GS:
+
+python3 gesture_realtime_server.py \
+  --chair-model /home/dzmitry/gesture_real_time_control/models/object_detector/efficientdet_lite0.tflite \
+  --chair_score_threshold 0.4
 

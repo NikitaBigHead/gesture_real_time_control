@@ -1,72 +1,182 @@
 from __future__ import annotations
 
 import argparse
+import re
+import struct
 import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-import cv2
-import mediapipe as mp
-import numpy as np
 import requests
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-from mediapipe.tasks.python.components.processors.classifier_options import ClassifierOptions
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
+    import mediapipe as mp
+    import numpy as np
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+    from mediapipe.tasks.python.components.processors.classifier_options import ClassifierOptions
+except ImportError:
+    mp = None
+    np = None
+    python = None
+    vision = None
+    ClassifierOptions = None
 
 try:
     import pyrealsense2 as rs
 except ImportError:
     rs = None
 
-from gesture_scrolling import (
-    DEFAULT_FPS,
-    DEFAULT_FRAME_HEIGHT,
-    DEFAULT_FRAME_WIDTH,
-    DEFAULT_GESTURE_HOLD_SEC,
-    DEFAULT_INITIAL_MEAN_WINDOW,
-    DEFAULT_MIN_GESTURE_SCORE,
-    DEFAULT_ZONE_WIDTH,
-    STATE_NONE,
-    compute_zone_bounds,
-    default_model_path as default_gesture_model_path,
-    draw_overlay,
-    get_thumb_tip_x_px,
-    get_thumb_up_hand_index,
-    mean_int,
-    resolve_state,
-)
-from realtime_asr_vad_pyaudio import (
-    DEFAULT_CHUNK,
-    DEFAULT_ENERGY_THRESHOLD_RMS,
-    DEFAULT_INPUT_RATE,
-    MODEL_AUDIO_RATE,
-    DEFAULT_OLLAMA_HOST,
-    DEFAULT_OLLAMA_MODEL,
-    DEFAULT_OLLAMA_TIMEOUT_SEC,
-    DEFAULT_VAD_THRESHOLD,
-    DEFAULT_WHISPER_MODEL,
-    RealTimeMicAsr,
-    list_input_devices,
-    open_microphone_stream,
-)
+try:
+    import zmq
+except ImportError:
+    zmq = None
+
+VIDEO_CLIENT_IMPORT_ERROR: Optional[BaseException] = None
+try:
+    from rag_interaction_video_client import (
+        DEFAULT_CAMERA_ID as DEFAULT_VIDEO_CAMERA_ID,
+        DEFAULT_FPS as DEFAULT_VIDEO_FPS,
+        DEFAULT_HEIGHT as DEFAULT_VIDEO_HEIGHT,
+        DEFAULT_JPEG_QUALITY as DEFAULT_VIDEO_JPEG_QUALITY,
+        DEFAULT_PORT as DEFAULT_VIDEO_PORT,
+        DEFAULT_SERVER_HOST as DEFAULT_VIDEO_SERVER_HOST,
+        DEFAULT_SOURCE as DEFAULT_VIDEO_SOURCE,
+        DEFAULT_TOPIC as DEFAULT_VIDEO_TOPIC,
+        DEFAULT_WIDTH as DEFAULT_VIDEO_WIDTH,
+        ZmqFramePublisher,
+        stream_realsense as stream_video_realsense,
+        stream_webcam as stream_video_webcam,
+    )
+except Exception as exc:
+    VIDEO_CLIENT_IMPORT_ERROR = exc
+    DEFAULT_VIDEO_SERVER_HOST = "127.0.0.1"
+    DEFAULT_VIDEO_PORT = 5550
+    DEFAULT_VIDEO_TOPIC = "rgb"
+    DEFAULT_VIDEO_SOURCE = "webcam"
+    DEFAULT_VIDEO_CAMERA_ID = 0
+    DEFAULT_VIDEO_WIDTH = 640
+    DEFAULT_VIDEO_HEIGHT = 480
+    DEFAULT_VIDEO_FPS = 30
+    DEFAULT_VIDEO_JPEG_QUALITY = 80
+    ZmqFramePublisher = None
+    stream_video_realsense = None
+    stream_video_webcam = None
+
+GESTURE_SCROLLING_IMPORT_ERROR: Optional[BaseException] = None
+try:
+    from gesture_scrolling import (
+        DEFAULT_FPS,
+        DEFAULT_FRAME_HEIGHT,
+        DEFAULT_FRAME_WIDTH,
+        DEFAULT_GESTURE_HOLD_SEC,
+        DEFAULT_INITIAL_MEAN_WINDOW,
+        DEFAULT_MIN_GESTURE_SCORE,
+        DEFAULT_ZONE_WIDTH,
+        STATE_NONE,
+        compute_zone_bounds,
+        default_model_path as default_gesture_model_path,
+        draw_overlay,
+        get_thumb_tip_x_px,
+        get_thumb_up_hand_index,
+        mean_int,
+        resolve_state,
+    )
+except Exception as exc:
+    GESTURE_SCROLLING_IMPORT_ERROR = exc
+    DEFAULT_FPS = 30
+    DEFAULT_FRAME_HEIGHT = 480
+    DEFAULT_FRAME_WIDTH = 640
+    DEFAULT_GESTURE_HOLD_SEC = 0.35
+    DEFAULT_INITIAL_MEAN_WINDOW = 5
+    DEFAULT_MIN_GESTURE_SCORE = 0.5
+    DEFAULT_ZONE_WIDTH = 120
+    STATE_NONE = "none"
+
+    def default_gesture_model_path() -> str:
+        return "gesture_recognizer.task"
+
+    def _missing_gesture_dependency(*_args, **_kwargs):
+        raise RuntimeError(
+            "Gesture client dependencies are unavailable. "
+            f"Original import error: {GESTURE_SCROLLING_IMPORT_ERROR}"
+        )
+
+    compute_zone_bounds = _missing_gesture_dependency
+    draw_overlay = _missing_gesture_dependency
+    get_thumb_tip_x_px = _missing_gesture_dependency
+    get_thumb_up_hand_index = _missing_gesture_dependency
+    mean_int = _missing_gesture_dependency
+    resolve_state = _missing_gesture_dependency
 
 
-DEFAULT_SERVER_URL = "http://127.0.0.1:8000/interact"
+REALTIME_ASR_IMPORT_ERROR: Optional[BaseException] = None
+try:
+    from realtime_asr_vad_pyaudio import (
+        DEFAULT_CHUNK,
+        DEFAULT_ENERGY_THRESHOLD_RMS,
+        DEFAULT_INPUT_RATE,
+        MODEL_AUDIO_RATE,
+        DEFAULT_VAD_THRESHOLD,
+        DEFAULT_WHISPER_MODEL,
+        RealTimeMicAsr,
+        list_input_devices,
+        open_microphone_stream,
+    )
+except Exception as exc:
+    REALTIME_ASR_IMPORT_ERROR = exc
+    DEFAULT_CHUNK = 1024
+    DEFAULT_ENERGY_THRESHOLD_RMS = 250.0
+    DEFAULT_INPUT_RATE = 48000
+    MODEL_AUDIO_RATE = 16000
+    DEFAULT_VAD_THRESHOLD = 0.35
+    DEFAULT_WHISPER_MODEL = "openai/whisper-medium"
+    RealTimeMicAsr = None
+
+    def list_input_devices() -> None:
+        raise RuntimeError(
+            "Speech client dependencies are unavailable. "
+            f"Original import error: {REALTIME_ASR_IMPORT_ERROR}"
+        )
+
+    def open_microphone_stream(*_args, **_kwargs):
+        raise RuntimeError(
+            "Speech client dependencies are unavailable. "
+            f"Original import error: {REALTIME_ASR_IMPORT_ERROR}"
+        )
+
+
+DEFAULT_SERVER_URL = "http://192.168.50.4:5550"
 DEFAULT_HTTP_TIMEOUT_SEC = 10
 DEFAULT_COOLDOWN_SEC = 5.0
-VALID_DIRECTIONS = {"left", "right", "none"}
+DEFAULT_MODE = "client"
+DEFAULT_SERVER_HOST = "192.168.50.4"
+DEFAULT_SERVER_PORT = 5550
+DEFAULT_MAX_STORED_MESSAGES = 200
+DEFAULT_GESTURE_VIDEO_SOURCE = "auto"
+DEFAULT_VIDEO_BIND_HOST = "0.0.0.0"
+DEFAULT_VIDEO_STREAM_TIMEOUT_MS = 1000
+VALID_DIRECTIONS = {"left", "right", "close", "open"}
+ROUTE_COMMAND = "command"
+ROUTE_QUERY = "query"
 
 
-@dataclass
-class PendingInteraction:
-    event_id: int
-    prompt: str
-    direction: str
-    trigger: str
-    created_monotonic: float
+def normalize_simple_command(command: Any) -> Optional[str]:
+    if not isinstance(command, str):
+        return None
+
+    normalized = " ".join(command.strip().lower().split())
+    if normalized in VALID_DIRECTIONS:
+        return normalized
+    return None
 
 
 class InteractionCoordinator:
@@ -76,143 +186,124 @@ class InteractionCoordinator:
         cooldown_sec: float,
         http_timeout_sec: int,
     ):
-        self._server_url = server_url
+        self._server_base_url = build_server_base_url(server_url)
+        self._command_url = build_endpoint_url(server_url, ROUTE_COMMAND)
+        self._query_url = build_endpoint_url(server_url, ROUTE_QUERY)
         self._cooldown_sec = cooldown_sec
         self._http_timeout_sec = http_timeout_sec
 
         self._lock = threading.Lock()
-        self._flush_lock = threading.Lock()
         self._latest_direction = STATE_NONE
-        self._latest_prompt: Optional[str] = None
-        self._pending: deque[PendingInteraction] = deque()
-        self._retry_not_before = 0.0
-        self._next_event_id = 1
+        self._retry_not_before_by_route = {
+            ROUTE_COMMAND: 0.0,
+            ROUTE_QUERY: 0.0,
+        }
 
-    def time_until_ready(self) -> float:
+    @property
+    def server_base_url(self) -> str:
+        return self._server_base_url
+
+    def time_until_ready(self, route: str) -> float:
         with self._lock:
-            return max(0.0, self._retry_not_before - time.monotonic())
-
-    def _enqueue_pending_locked(
-        self,
-        prompt: str,
-        direction: str,
-        trigger: str,
-    ) -> PendingInteraction:
-        pending = PendingInteraction(
-            event_id=self._next_event_id,
-            prompt=prompt,
-            direction=direction,
-            trigger=trigger,
-            created_monotonic=time.monotonic(),
-        )
-        self._next_event_id += 1
-        self._pending.append(pending)
-        return pending
+            return max(0.0, self._retry_not_before_by_route[route] - time.monotonic())
 
     def update_direction(self, direction: str) -> None:
-        direction = direction.strip().lower()
-        if direction not in VALID_DIRECTIONS:
+        direction = normalize_simple_command(direction)
+        if direction is None:
             return
 
         with self._lock:
             if direction == self._latest_direction:
                 return
             self._latest_direction = direction
-            latest_prompt = self._latest_prompt
-            if latest_prompt:
-                self._enqueue_pending_locked(
-                    prompt=latest_prompt,
-                    direction=direction,
-                    trigger="direction",
-                )
 
-        if latest_prompt is None:
-            return
-
-        retry_remaining = self.time_until_ready()
-        if retry_remaining > 0:
-            print(
-                f"[RAG_CLIENT][QUEUE] Direction change queued for {retry_remaining:.1f}s retry delay",
-                flush=True,
-            )
-        self.flush_pending()
+        self._post_route(
+            route=ROUTE_COMMAND,
+            url=self._command_url,
+            payload={"command": direction},
+        )
 
     def update_prompt(self, prompt: str) -> None:
         prompt = prompt.strip()
         if not prompt:
             return
 
-        retry_remaining = self.time_until_ready()
-        with self._lock:
-            self._latest_prompt = prompt
-            self._enqueue_pending_locked(
-                prompt=prompt,
-                direction=self._latest_direction,
-                trigger="phrase",
-            )
-
-        print(f"[RAG_CLIENT][RECOGNIZED_PHRASE] {prompt}", flush=True)
-        if retry_remaining > 0:
+        command = normalize_simple_command(prompt)
+        if command is not None:
             print(
-                f"[RAG_CLIENT][QUEUE] Phrase queued for {retry_remaining:.1f}s retry delay",
+                f"[RAG_CLIENT][RECOGNIZED_COMMAND] {command}",
                 flush=True,
             )
-        self.flush_pending()
+            self._post_route(
+                route=ROUTE_COMMAND,
+                url=self._command_url,
+                payload={"command": command},
+            )
+            return
 
-    def flush_pending(self) -> bool:
-        if not self._flush_lock.acquire(blocking=False):
+        print(f"[RAG_CLIENT][RECOGNIZED_QUERY] {prompt}", flush=True)
+        self._post_route(
+            route=ROUTE_QUERY,
+            url=self._query_url,
+            payload={"query": prompt},
+        )
+
+    def _post_route(
+        self,
+        route: str,
+        url: str,
+        payload: dict[str, str],
+    ) -> bool:
+        retry_remaining = self.time_until_ready(route)
+        if retry_remaining > 0:
+            print(
+                f"[RAG_CLIENT][SKIP][{route.upper()}] cooldown={retry_remaining:.1f}s payload={payload}",
+                flush=True,
+            )
             return False
 
-        sent_any = False
         try:
-            while True:
-                with self._lock:
-                    now = time.monotonic()
-                    if not self._pending or now < self._retry_not_before:
-                        return sent_any
+            print(f"[RAG_CLIENT][SENDING][{route.upper()}] url={url} payload={payload}", flush=True)
+            response = requests.post(
+                url,
+                json=payload,
+                timeout=self._http_timeout_sec,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            print(
+                f"[RAG_CLIENT][ERROR][{route.upper()}] POST failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            with self._lock:
+                self._retry_not_before_by_route[route] = time.monotonic() + self._cooldown_sec
+            return False
 
-                    pending = self._pending[0]
-                    payload = {
-                        "prompt": pending.prompt,
-                        "direction": pending.direction,
-                    }
+        with self._lock:
+            self._retry_not_before_by_route[route] = 0.0
 
-                try:
-                    print(f"[RAG_CLIENT][SENDING] {payload}", flush=True)
-                    response = requests.post(
-                        self._server_url,
-                        json=payload,
-                        timeout=self._http_timeout_sec,
-                    )
-                    response.raise_for_status()
-                except requests.RequestException as exc:
-                    print(f"[RAG_CLIENT][ERROR] POST failed: {exc}", file=sys.stderr, flush=True)
-                    with self._lock:
-                        self._retry_not_before = time.monotonic() + self._cooldown_sec
-                    return sent_any
+        print(
+            f"[RAG_CLIENT][POST][{route.upper()}] status={response.status_code} body={truncate_text(response.text)}",
+            flush=True,
+        )
+        return True
 
-                with self._lock:
-                    if self._pending and self._pending[0].event_id == pending.event_id:
-                        self._pending.popleft()
-                    self._retry_not_before = 0.0
 
-                response_preview = response.text.strip()
-                if len(response_preview) > 200:
-                    response_preview = response_preview[:200] + "..."
-                print(f"[RAG_CLIENT][POST] {payload}", flush=True)
-                print(
-                    f"[RAG_CLIENT][SERVER_RESPONSE] status={response.status_code} body={response_preview}",
-                    flush=True,
-                )
-                sent_any = True
-        finally:
-            self._flush_lock.release()
+def build_server_base_url(server_url: str) -> str:
+    clean_url = server_url.rstrip("/")
+    for suffix in ("/command", "/query", "/interact", "/health"):
+        if clean_url.endswith(suffix):
+            return clean_url[: -len(suffix)]
+    return clean_url
+
+
+def build_endpoint_url(server_url: str, endpoint: str) -> str:
+    return build_server_base_url(server_url) + f"/{endpoint}"
 
 
 def build_health_url(server_url: str) -> str:
-    if server_url.endswith("/interact"):
-        return server_url[: -len("/interact")] + "/health"
-    return server_url.rstrip("/") + "/health"
+    return build_server_base_url(server_url) + "/health"
 
 
 def check_server_health(server_url: str, http_timeout_sec: int) -> None:
@@ -233,6 +324,211 @@ def check_server_health(server_url: str, http_timeout_sec: int) -> None:
             file=sys.stderr,
             flush=True,
         )
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def truncate_text(text: str, limit: int = 200) -> str:
+    text = text.strip()
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def build_missing_fastapi_message() -> str:
+    return (
+        "FastAPI server mode requires 'fastapi' and 'uvicorn'. Install them with:\n"
+        "  /home/dzmitry/gesture_real_time_control/.venv/bin/pip install fastapi uvicorn"
+    )
+
+
+def require_fastapi_dependencies() -> tuple[Any, Any]:
+    try:
+        from fastapi import FastAPI, HTTPException
+    except ImportError as exc:
+        raise RuntimeError(build_missing_fastapi_message()) from exc
+    return FastAPI, HTTPException
+
+
+def require_uvicorn() -> Any:
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise RuntimeError(build_missing_fastapi_message()) from exc
+    return uvicorn
+
+
+def build_missing_video_client_message() -> str:
+    return (
+        "Video client mode requires rag_interaction_video_client.py and its dependencies. "
+        f"Original import error: {VIDEO_CLIENT_IMPORT_ERROR}"
+    )
+
+
+class InteractionRouterService:
+    def __init__(
+        self,
+        max_stored_messages: int,
+    ):
+        self._lock = threading.Lock()
+        max_messages = max(1, max_stored_messages)
+        self._commands: deque[dict[str, Any]] = deque(maxlen=max_messages)
+        self._queries: deque[dict[str, Any]] = deque(maxlen=max_messages)
+
+    def health_payload(self) -> dict[str, Any]:
+        with self._lock:
+            counts = {
+                "commands": len(self._commands),
+                "queries": len(self._queries),
+            }
+        return {
+            "ok": True,
+            "status": "healthy",
+            "routes": ["/command", "/query", "/health"],
+            "counts": counts,
+        }
+
+    def record_command(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+
+        command = normalize_simple_command(payload.get("command"))
+        if command is None:
+            raise ValueError(
+                f"Field 'command' must be one of {sorted(VALID_DIRECTIONS)}"
+            )
+
+        record = {
+            "command": command,
+            "received_at_utc": utc_now_iso(),
+        }
+
+        with self._lock:
+            self._commands.appendleft(record)
+
+        print(f"[RAG_SERVER][COMMAND] {record}", flush=True)
+        return record
+
+    def record_query(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+
+        query = payload.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("Field 'query' must be a non-empty string")
+
+        record = {
+            "query": query.strip(),
+            "received_at_utc": utc_now_iso(),
+        }
+
+        with self._lock:
+            self._queries.appendleft(record)
+
+        print(f"[RAG_SERVER][QUERY] {record}", flush=True)
+        return record
+
+
+def create_fastapi_app(args: argparse.Namespace) -> Any:
+    FastAPI, HTTPException = require_fastapi_dependencies()
+    service = InteractionRouterService(
+        max_stored_messages=args.max_stored_messages,
+    )
+    app = FastAPI(
+        title="RAG Interaction Server",
+        version="0.3.0",
+        description="Minimal FastAPI server with /command and /query endpoints.",
+    )
+
+    @app.get("/")
+    def root() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "routes": ["/command", "/query", "/health"],
+        }
+
+    @app.get("/health")
+    def health() -> dict[str, Any]:
+        return service.health_payload()
+
+    @app.post("/command")
+    def command(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            record = service.record_command(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "route": ROUTE_COMMAND, "data": record}
+
+    @app.post("/query")
+    def query(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            record = service.record_query(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "route": ROUTE_QUERY, "data": record}
+
+    return app
+
+
+def run_server(args: argparse.Namespace) -> int:
+    uvicorn = require_uvicorn()
+    app = create_fastapi_app(args)
+    print(
+        "[RAG_SERVER] Starting FastAPI server "
+        f"host={args.host} port={args.port} routes=/command,/query",
+        flush=True,
+    )
+    uvicorn.run(app, host=args.host, port=args.port)
+    return 0
+
+
+def run_video_client_mode(args: argparse.Namespace) -> int:
+    if (
+        VIDEO_CLIENT_IMPORT_ERROR is not None
+        or ZmqFramePublisher is None
+        or stream_video_webcam is None
+        or stream_video_realsense is None
+    ):
+        raise RuntimeError(build_missing_video_client_message())
+
+    video_args = argparse.Namespace(
+        server_host=args.video_server_host,
+        port=args.video_port,
+        topic=args.video_topic,
+        source=args.video_source,
+        camera_id=args.video_camera_id,
+        width=args.video_width,
+        height=args.video_height,
+        fps=args.video_fps,
+        jpeg_quality=args.video_jpeg_quality,
+        mirror=args.video_mirror,
+        preview=args.video_preview,
+    )
+
+    publisher = ZmqFramePublisher(
+        server_host=video_args.server_host,
+        port=video_args.port,
+        topic=video_args.topic,
+    )
+    print(
+        "[RAG_VIDEO_CLIENT] Streaming video "
+        f"source={video_args.source} endpoint={publisher.endpoint} "
+        f"topic={video_args.topic} size={video_args.width}x{video_args.height} "
+        f"fps={video_args.fps} jpeg_quality={video_args.jpeg_quality}",
+        flush=True,
+    )
+
+    try:
+        if video_args.source == "realsense":
+            return stream_video_realsense(video_args, publisher)
+        return stream_video_webcam(video_args, publisher)
+    except KeyboardInterrupt:
+        print("[RAG_VIDEO_CLIENT] Stopping...", flush=True)
+        return 0
+    finally:
+        publisher.close()
 
 
 class SpeechRecognitionRunner:
@@ -268,6 +564,12 @@ class SpeechRecognitionRunner:
 
     def _run(self) -> None:
         try:
+            if REALTIME_ASR_IMPORT_ERROR is not None or RealTimeMicAsr is None:
+                raise RuntimeError(
+                    "Speech recognition dependencies are unavailable. "
+                    f"Original import error: {REALTIME_ASR_IMPORT_ERROR}"
+                )
+
             self._asr = RealTimeMicAsr(
                 input_rate=self._args.input_rate,
                 frames_per_buffer=self._args.frames_per_buffer,
@@ -275,9 +577,6 @@ class SpeechRecognitionRunner:
                 language=self._args.language or None,
                 vad_threshold=self._args.vad_threshold,
                 phrase_end_delay_sec=self._args.phrase_end_delay_sec,
-                ollama_host=self._args.ollama_host,
-                ollama_model=self._args.ollama_model,
-                ollama_timeout_sec=self._args.ollama_timeout,
                 enable_drone_commands=False,
                 on_transcript=self._coordinator.update_prompt,
                 audio_debug=self._args.audio_debug,
@@ -341,41 +640,28 @@ class SpeechRecognitionRunner:
             except Exception:
                 pass
             self._pa = None
-
-
-class CooldownFlushWorker:
-    def __init__(self, coordinator: InteractionCoordinator):
-        self._coordinator = coordinator
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            daemon=True,
-            name="CooldownFlushWorker",
-        )
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        self._thread.join(timeout=2.0)
-
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            self._coordinator.flush_pending()
-            time.sleep(0.1)
-
-
 class GestureDirectionRunner:
     def __init__(self, args: argparse.Namespace, coordinator: InteractionCoordinator):
         self._args = args
         self._coordinator = coordinator
         self._last_state = STATE_NONE
 
-    def run(self) -> None:
-        if rs is None:
-            raise RuntimeError("pyrealsense2 is not installed. Install the RealSense SDK Python package first.")
+    def _ensure_dependencies(self) -> None:
+        if (
+            cv2 is None
+            or mp is None
+            or np is None
+            or python is None
+            or vision is None
+            or ClassifierOptions is None
+            or GESTURE_SCROLLING_IMPORT_ERROR is not None
+        ):
+            raise RuntimeError(
+                "Gesture direction dependencies are unavailable. "
+                f"Original import error: {GESTURE_SCROLLING_IMPORT_ERROR}"
+            )
 
+    def _create_recognizer(self):
         base_options = python.BaseOptions(model_asset_path=self._args.gesture_model)
         options = vision.GestureRecognizerOptions(
             base_options=base_options,
@@ -391,7 +677,14 @@ class GestureDirectionRunner:
                 score_threshold=self._args.min_score,
             ),
         )
-        recognizer = vision.GestureRecognizer.create_from_options(options)
+        return vision.GestureRecognizer.create_from_options(options)
+
+    def _iter_realsense_frames(self):
+        if rs is None:
+            raise RuntimeError(
+                "pyrealsense2 is not installed. Install the RealSense SDK Python package first."
+            )
+
         pipeline = rs.pipeline()
         config = rs.config()
         config.enable_stream(
@@ -402,18 +695,11 @@ class GestureDirectionRunner:
             DEFAULT_FPS,
         )
 
-        zone_left_px: Optional[int] = None
-        zone_right_px: Optional[int] = None
-        last_timestamp_ms = 0
         pipeline_started = False
-        initial_pose_samples: deque[int] = deque(maxlen=max(1, self._args.initial_mean_window))
-        initial_pose_locked = False
-        last_seen_monotonic: Optional[float] = None
-        last_thumb_x_px: Optional[int] = None
-
         try:
             pipeline.start(config)
             pipeline_started = True
+            print("[RAG_CLIENT][VIDEO] Using local RealSense color stream.", flush=True)
 
             for _ in range(10):
                 try:
@@ -437,7 +723,81 @@ class GestureDirectionRunner:
                     continue
 
                 frame_bgr = np.asanyarray(color_frame.get_data())
-                frame_bgr = cv2.flip(frame_bgr, 1)
+                yield cv2.flip(frame_bgr, 1)
+        finally:
+            if pipeline_started:
+                pipeline.stop()
+
+    def _iter_stream_frames(self):
+        if zmq is None:
+            raise RuntimeError(
+                "pyzmq is not installed. Install it with: /home/dzmitry/gesture_real_time_control/.venv/bin/pip install pyzmq"
+            )
+
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.RCVHWM, 10)
+        sock.setsockopt(zmq.RCVTIMEO, self._args.video_stream_timeout_ms)
+        sock.bind(f"tcp://{self._args.video_bind_host}:{self._args.video_port}")
+        sock.setsockopt(zmq.SUBSCRIBE, self._args.video_topic.encode("utf-8"))
+
+        print(
+            "[RAG_CLIENT][VIDEO] Waiting for streamed RGB video "
+            f"bind={self._args.video_bind_host}:{self._args.video_port} topic={self._args.video_topic}",
+            flush=True,
+        )
+
+        try:
+            while True:
+                try:
+                    _, ts_bytes, payload = sock.recv_multipart()
+                    _ = struct.unpack("d", ts_bytes)[0]
+                except zmq.Again:
+                    continue
+
+                frame_buffer = np.frombuffer(payload, dtype=np.uint8)
+                frame_bgr = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
+                if frame_bgr is None:
+                    print("[RAG_CLIENT][VIDEO][WARN] Failed to decode JPEG frame.", flush=True)
+                    continue
+
+                yield frame_bgr
+        finally:
+            sock.close()
+
+    def _iter_frames(self):
+        source = self._args.gesture_video_source
+        if source == "realsense":
+            yield from self._iter_realsense_frames()
+            return
+
+        if source == "stream":
+            yield from self._iter_stream_frames()
+            return
+
+        try:
+            yield from self._iter_realsense_frames()
+        except RuntimeError as exc:
+            print(
+                f"[RAG_CLIENT][VIDEO][WARN] RealSense unavailable ({exc}). Falling back to streamed RGB input.",
+                flush=True,
+            )
+            yield from self._iter_stream_frames()
+
+    def run(self) -> None:
+        self._ensure_dependencies()
+        recognizer = self._create_recognizer()
+
+        zone_left_px: Optional[int] = None
+        zone_right_px: Optional[int] = None
+        last_timestamp_ms = 0
+        initial_pose_samples: deque[int] = deque(maxlen=max(1, self._args.initial_mean_window))
+        initial_pose_locked = False
+        last_seen_monotonic: Optional[float] = None
+        last_thumb_x_px: Optional[int] = None
+
+        try:
+            for frame_bgr in self._iter_frames():
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
@@ -506,20 +866,27 @@ class GestureDirectionRunner:
                 if key in (27, ord("q")):
                     break
         finally:
-            if pipeline_started:
-                pipeline.stop()
             cv2.destroyAllWindows()
             recognizer.close()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Integrated speech + direction client that POSTs prompt and direction to a REST server.",
+        description=(
+            "Integrated speech + gesture client, minimal FastAPI server, "
+            "or ZMQ video streaming client for rag_interaction."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("client", "server", "video-client"),
+        default=DEFAULT_MODE,
+        help=f"Run as the speech/gesture client, HTTP server, or video streaming client. Default: {DEFAULT_MODE}",
     )
     parser.add_argument(
         "--server-url",
         default=DEFAULT_SERVER_URL,
-        help=f"REST endpoint that receives POST requests. Default: {DEFAULT_SERVER_URL}",
+        help=f"Server base URL used by the client. Default: {DEFAULT_SERVER_URL}",
     )
     parser.add_argument(
         "--cooldown-sec",
@@ -532,6 +899,108 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_HTTP_TIMEOUT_SEC,
         help=f"HTTP timeout in seconds. Default: {DEFAULT_HTTP_TIMEOUT_SEC}",
+    )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_SERVER_HOST,
+        help=f"FastAPI bind host in server mode. Default: {DEFAULT_SERVER_HOST}",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_SERVER_PORT,
+        help=f"FastAPI bind port in server mode. Default: {DEFAULT_SERVER_PORT}",
+    )
+    parser.add_argument(
+        "--max-stored-messages",
+        type=int,
+        default=DEFAULT_MAX_STORED_MESSAGES,
+        help=f"How many recent routed messages to keep in memory in server mode. Default: {DEFAULT_MAX_STORED_MESSAGES}",
+    )
+    parser.add_argument(
+        "--gesture-video-source",
+        choices=("auto", "realsense", "stream"),
+        default=DEFAULT_GESTURE_VIDEO_SOURCE,
+        help=(
+            "Where gesture frames come from in client mode. "
+            f"Default: {DEFAULT_GESTURE_VIDEO_SOURCE}"
+        ),
+    )
+    parser.add_argument(
+        "--video-bind-host",
+        default=DEFAULT_VIDEO_BIND_HOST,
+        help=f"Bind host for receiving streamed RGB video in client mode. Default: {DEFAULT_VIDEO_BIND_HOST}",
+    )
+    parser.add_argument(
+        "--video-server-host",
+        default=DEFAULT_VIDEO_SERVER_HOST,
+        help=f"ZMQ receiver host in video-client mode. Default: {DEFAULT_VIDEO_SERVER_HOST}",
+    )
+    parser.add_argument(
+        "--video-port",
+        type=int,
+        default=DEFAULT_VIDEO_PORT,
+        help=f"ZMQ receiver RGB port in video-client mode. Default: {DEFAULT_VIDEO_PORT}",
+    )
+    parser.add_argument(
+        "--video-topic",
+        default=DEFAULT_VIDEO_TOPIC,
+        help=f"ZMQ topic in video-client mode. Default: {DEFAULT_VIDEO_TOPIC}",
+    )
+    parser.add_argument(
+        "--video-source",
+        choices=("webcam", "realsense"),
+        default=DEFAULT_VIDEO_SOURCE,
+        help=f"Video source in video-client mode. Default: {DEFAULT_VIDEO_SOURCE}",
+    )
+    parser.add_argument(
+        "--video-camera-id",
+        type=int,
+        default=DEFAULT_VIDEO_CAMERA_ID,
+        help=f"OpenCV webcam id in video-client mode. Default: {DEFAULT_VIDEO_CAMERA_ID}",
+    )
+    parser.add_argument(
+        "--video-width",
+        type=int,
+        default=DEFAULT_VIDEO_WIDTH,
+        help=f"Requested video frame width in video-client mode. Default: {DEFAULT_VIDEO_WIDTH}",
+    )
+    parser.add_argument(
+        "--video-height",
+        type=int,
+        default=DEFAULT_VIDEO_HEIGHT,
+        help=f"Requested video frame height in video-client mode. Default: {DEFAULT_VIDEO_HEIGHT}",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=int,
+        default=DEFAULT_VIDEO_FPS,
+        help=f"Requested video FPS in video-client mode. Default: {DEFAULT_VIDEO_FPS}",
+    )
+    parser.add_argument(
+        "--video-jpeg-quality",
+        type=int,
+        default=DEFAULT_VIDEO_JPEG_QUALITY,
+        help=f"JPEG quality 0-100 in video-client mode. Default: {DEFAULT_VIDEO_JPEG_QUALITY}",
+    )
+    parser.add_argument(
+        "--video-mirror",
+        action="store_true",
+        help="Mirror video frames horizontally in video-client mode.",
+    )
+    parser.add_argument(
+        "--video-preview",
+        action="store_true",
+        help="Show a local preview window in video-client mode. Press q to stop.",
+    )
+    parser.add_argument(
+        "--video-stream-timeout-ms",
+        type=int,
+        default=DEFAULT_VIDEO_STREAM_TIMEOUT_MS,
+        help=(
+            "ZMQ receive timeout in milliseconds when using streamed RGB input in client mode. "
+            f"Default: {DEFAULT_VIDEO_STREAM_TIMEOUT_MS}"
+        ),
     )
     parser.add_argument(
         "--list-devices",
@@ -592,24 +1061,6 @@ def parse_args() -> argparse.Namespace:
         help="Seconds of silence before a phrase is finalized",
     )
     parser.add_argument(
-        "--ollama-host",
-        type=str,
-        default=DEFAULT_OLLAMA_HOST,
-        help=f"Ollama server URL used by the shared ASR module. Default: {DEFAULT_OLLAMA_HOST}",
-    )
-    parser.add_argument(
-        "--ollama-model",
-        type=str,
-        default=DEFAULT_OLLAMA_MODEL,
-        help=f"Ollama model name used by the shared ASR module. Default: {DEFAULT_OLLAMA_MODEL}",
-    )
-    parser.add_argument(
-        "--ollama-timeout",
-        type=int,
-        default=DEFAULT_OLLAMA_TIMEOUT_SEC,
-        help=f"Ollama request timeout in seconds. Default: {DEFAULT_OLLAMA_TIMEOUT_SEC}",
-    )
-    parser.add_argument(
         "--gesture-model",
         "--model",
         type=str,
@@ -652,6 +1103,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.mode == "server":
+        try:
+            return run_server(args)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr, flush=True)
+            return 1
+    if args.mode == "video-client":
+        try:
+            return run_video_client_mode(args)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr, flush=True)
+            return 1
+
     if args.list_devices:
         list_input_devices()
         return 0
@@ -662,14 +1126,23 @@ def main() -> int:
         http_timeout_sec=args.http_timeout,
     )
     speech_runner = SpeechRecognitionRunner(args, coordinator)
-    cooldown_worker = CooldownFlushWorker(coordinator)
     direction_runner = GestureDirectionRunner(args, coordinator)
 
-    check_server_health(args.server_url, args.http_timeout)
+    check_server_health(coordinator.server_base_url, args.http_timeout)
     speech_runner.start()
-    cooldown_worker.start()
 
-    print(f"[RAG_CLIENT] Server URL: {args.server_url}", flush=True)
+    print(
+        f"[RAG_CLIENT] Server URL: {coordinator.server_base_url} "
+        f"(query={build_endpoint_url(coordinator.server_base_url, ROUTE_QUERY)}, "
+        f"command={build_endpoint_url(coordinator.server_base_url, ROUTE_COMMAND)})",
+        flush=True,
+    )
+    print(
+        "[RAG_CLIENT] Gesture video source: "
+        f"{args.gesture_video_source} "
+        f"(stream bind={args.video_bind_host}:{args.video_port} topic={args.video_topic})",
+        flush=True,
+    )
     print("[RAG_CLIENT] Speech recognition and direction detection started.", flush=True)
     print("[RAG_CLIENT] Press 'q' in the direction window or Ctrl+C to stop.", flush=True)
 
@@ -678,7 +1151,6 @@ def main() -> int:
     except KeyboardInterrupt:
         print("[RAG_CLIENT] Stopping...", flush=True)
     finally:
-        cooldown_worker.stop()
         speech_runner.stop()
 
     if speech_runner.error is not None:

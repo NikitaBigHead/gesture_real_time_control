@@ -202,6 +202,74 @@ def open_microphone_stream(microphone_device_id: Optional[int], input_rate: int,
     return pa, stream
 
 
+def _normalize_object_label(label: str) -> str:
+    return "_".join(re.findall(r"[a-z0-9]+", label.strip().lower()))
+
+
+def extract_chair_detections(detection_result, score_threshold: float) -> list[dict]:
+    chairs = []
+    for detection in getattr(detection_result, "detections", []) or []:
+        bbox = getattr(detection, "bounding_box", None)
+        if bbox is None:
+            continue
+
+        chair_score = 0.0
+        for category in getattr(detection, "categories", []) or []:
+            category_name = _normalize_object_label(
+                getattr(category, "category_name", None)
+                or getattr(category, "display_name", None)
+                or ""
+            )
+            category_score = float(getattr(category, "score", 0.0) or 0.0)
+            if category_name in {"chair", "chairs"} and category_score > chair_score:
+                chair_score = category_score
+
+        if chair_score < score_threshold:
+            continue
+
+        chairs.append(
+            {
+                "x": int(getattr(bbox, "origin_x", 0)),
+                "y": int(getattr(bbox, "origin_y", 0)),
+                "w": int(getattr(bbox, "width", 0)),
+                "h": int(getattr(bbox, "height", 0)),
+                "score": chair_score,
+            }
+        )
+    return chairs
+
+
+def draw_chair_detections(image_bgr, chair_detections: list[dict]) -> None:
+    height, width = image_bgr.shape[:2]
+    for chair in chair_detections:
+        x0 = max(0, chair["x"])
+        y0 = max(0, chair["y"])
+        x1 = min(width - 1, x0 + max(0, chair["w"]))
+        y1 = min(height - 1, y0 + max(0, chair["h"]))
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        cv2.rectangle(
+            image_bgr,
+            (x0, y0),
+            (x1, y1),
+            (0, 200, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        label_y = max(24, y0 - 10)
+        cv2.putText(
+            image_bgr,
+            f"chair {chair['score']:.2f}",
+            (x0, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 200, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+
 def first_existing_path(*candidates: Path) -> str:
     for candidate in candidates:
         if candidate.is_file():
@@ -545,6 +613,10 @@ class GestureServerRuntime:
 
         self._recognizer = self._create_gesture_recognizer(args.model, args.use_gpu)
         self._pose_landmarker = self._create_pose_landmarker(args.pose_model, args.use_gpu)
+        self._chair_detector = self._create_chair_detector(
+            args.chair_model,
+            args.use_gpu,
+        )
         if not args.disable_voice_command_pub:
             self._start_voice_command_publisher()
         self._audio = AudioSpeechPipeline(
@@ -588,6 +660,38 @@ class GestureServerRuntime:
             output_segmentation_masks=False,
         )
         return vision.PoseLandmarker.create_from_options(options)
+
+    def _create_chair_detector(self, model_path: str, use_gpu: bool):
+        if not model_path:
+            log.info("Chair detection disabled; no --chair-model was provided.")
+            return None
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Chair detection model not found: {model_path}")
+
+        if not hasattr(vision, "ObjectDetectorOptions") or not hasattr(vision, "ObjectDetector"):
+            log.warning("Chair detection disabled; MediaPipe ObjectDetector API is unavailable.")
+            return None
+
+        options = vision.ObjectDetectorOptions(
+            base_options=build_base_options(model_path, use_gpu),
+            running_mode=vision.RunningMode.VIDEO,
+            max_results=self.args.chair_max_results,
+            score_threshold=self.args.chair_score_threshold,
+        )
+        detector = vision.ObjectDetector.create_from_options(options)
+        log.info("Chair detection enabled using model=%s", model_path)
+        return detector
+
+    def _detect_chairs(self, mp_image: mp.Image, timestamp_ms: int) -> list[dict]:
+        if self._chair_detector is None:
+            return []
+
+        detection_result = self._chair_detector.detect_for_video(mp_image, timestamp_ms)
+        return extract_chair_detections(
+            detection_result,
+            self.args.chair_score_threshold,
+        )
 
     def _ensure_rclpy(self) -> None:
         if not rclpy.ok():
@@ -743,7 +847,11 @@ class GestureServerRuntime:
 
         result = self._recognizer.recognize_for_video(mp_image, timestamp_ms)
         pose_result = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-        draw_person_bbox(frame, pose_result)
+        chair_detections = self._detect_chairs(mp_image, timestamp_ms)
+        if self._chair_detector is not None:
+            draw_chair_detections(frame, chair_detections)
+        else:
+            draw_person_bbox(frame, pose_result)
 
         if result.hand_landmarks:
             self._no_hand_frames = 0
@@ -821,6 +929,8 @@ class GestureServerRuntime:
 
         self._recognizer.close()
         self._pose_landmarker.close()
+        if self._chair_detector is not None:
+            self._chair_detector.close()
         cv2.destroyAllWindows()
 
 
@@ -1005,6 +1115,26 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=default_pose_model_path(),
         help="Path to MediaPipe pose landmarker task model",
+    )
+    parser.add_argument(
+        "--chair-model",
+        type=str,
+        default="",
+        help="Optional MediaPipe object detector .task/.tflite model used to detect chairs",
+    )
+    parser.add_argument(
+        "--chair-score-threshold",
+        "--chair_score_threshold",
+        type=float,
+        dest="chair_score_threshold",
+        default=0.35,
+        help="Minimum score for drawing a detected chair bounding box",
+    )
+    parser.add_argument(
+        "--chair-max-results",
+        type=int,
+        default=5,
+        help="Maximum number of object detections returned by the chair detector",
     )
     parser.add_argument(
         "--use-gpu",

@@ -7,6 +7,44 @@ cd deep_control
 python gesture_realtime_hand_deep.py
 ```
 
+## RAG Interaction Server
+
+`rag_interaction.py` can now run in three modes:
+
+- `--mode client` sends gesture commands to `/command` and spoken text to `/query`.
+- `--mode server` starts a minimal FastAPI server with those two endpoints.
+- `--mode video-client` streams RGB video over ZMQ to an RGB receiver.
+
+Run the server:
+
+```bash
+python rag_interaction.py --mode server --host 0.0.0.0 --port 8000
+```
+
+Run the video client:
+
+```bash
+python rag_interaction.py --mode video-client --video-server-host 127.0.0.1 --video-preview
+```
+
+To make `--mode client` receive gesture frames from that streamed video instead of a local RealSense camera:
+
+```bash
+python rag_interaction.py --mic-id 3 --gesture-video-source stream --video-bind-host 0.0.0.0 --video-port 5550
+```
+
+Endpoints:
+
+- `POST /command` - accepts `{"command": "left" | "right" | "close" | "open"}`
+- `POST /query` - accepts `{"query": "..." }`
+- `GET /health` - health check.
+
+If FastAPI is not installed yet:
+
+```bash
+/home/dzmitry/gesture_real_time_control/.venv/bin/pip install fastapi uvicorn
+```
+
 ## deep_control
 
 `deep_control` is the main real-time gesture control module. It gets RGB and depth data from RealSense, detects hands and body pose with MediaPipe, computes the hand control state, and sends commands to the drone through ROS 2 / MAVROS when needed.
