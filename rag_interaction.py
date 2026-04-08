@@ -208,8 +208,11 @@ class InteractionCoordinator:
             return max(0.0, self._retry_not_before_by_route[route] - time.monotonic())
 
     def update_direction(self, direction: str) -> None:
-        direction = normalize_simple_command(direction)
-        if direction is None:
+        if not isinstance(direction, str):
+            return
+
+        direction = " ".join(direction.strip().lower().split())
+        if direction not in VALID_DIRECTIONS and direction != STATE_NONE:
             return
 
         with self._lock:
@@ -217,10 +220,14 @@ class InteractionCoordinator:
                 return
             self._latest_direction = direction
 
+        normalized_direction = normalize_simple_command(direction)
+        if normalized_direction is None:
+            return
+
         self._post_route(
             route=ROUTE_COMMAND,
             url=self._command_url,
-            payload={"command": direction},
+            payload={"command": normalized_direction},
         )
 
     def update_prompt(self, prompt: str) -> None:
